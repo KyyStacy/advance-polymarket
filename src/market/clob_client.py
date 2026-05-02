@@ -1,7 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
 from typing import Any
+
+# Suppress noisy per-request error output from the py_clob_client_v2 library.
+# FAK "no orders found" (400) is a normal transient condition, not a real error.
+logging.getLogger("py_clob_client_v2").setLevel(logging.CRITICAL)
+
+
+class _LibOutputFilter:
+    """Wraps stdout/stderr to drop [py_clob_client_v2] request-error lines."""
+
+    _TAG = "[py_clob_client_v2] request error"
+
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        if self._TAG in text:
+            return len(text)
+        return self._stream.write(text)  # type: ignore[union-attr]
+
+    def flush(self) -> None:
+        self._stream.flush()  # type: ignore[union-attr]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
+if not isinstance(sys.stdout, _LibOutputFilter):
+    sys.stdout = _LibOutputFilter(sys.stdout)  # type: ignore[assignment]
+if not isinstance(sys.stderr, _LibOutputFilter):
+    sys.stderr = _LibOutputFilter(sys.stderr)  # type: ignore[assignment]
 
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
@@ -198,7 +230,7 @@ class PolymarketClobClient:
             order_type=order_type,
             user_usdc_balance=self._bankroll_cache,
         )
-        signed = await asyncio.to_thread(self.client.create_market_order, args)
+        signed = self.client.create_market_order(args)  # CPU-only signing, no I/O
         resp = await asyncio.to_thread(self.client.post_order, signed, order_type)
         return resp if isinstance(resp, dict) else {"raw": resp}
 
@@ -255,6 +287,6 @@ class PolymarketClobClient:
             side=SELL,
             user_usdc_balance=self._bankroll_cache,
         )
-        signed = await asyncio.to_thread(self.client.create_market_order, args)
+        signed = self.client.create_market_order(args)  # CPU-only signing, no I/O
         resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
         return resp if isinstance(resp, dict) else {"raw": resp}

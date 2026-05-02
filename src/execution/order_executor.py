@@ -18,12 +18,15 @@ _ORDER_FAIL_COOLDOWN_SEC = 5.0
 # triggered fallback estimates that masked actual fill prices.
 _FILL_POLL_DEADLINE_SEC = 10.0
 _FILL_POLL_INTERVAL_SEC = 0.25
+# Fast polling for first 2s: catches quick EOA fills without flooding later
+_FILL_POLL_FAST_SEC = 0.10
+_FILL_POLL_FAST_WINDOW_SEC = 2.0
 # Minimum balance change considered a real fill (filters out dust noise)
 _BALANCE_DELTA_EPSILON = 0.005
-# Max ask drift from signal price that still allows market entry.
-# If fresh ask > expected_ask + this threshold, the edge is considered gone
-# and the order is aborted. Protects against retrying into a worse price.
-_MARKET_ENTRY_MAX_DRIFT = 0.04
+# Max ask drift (absolute USD) validated in main.py before calling buy_to_open.
+# Kept here as a named constant so entry_engine / main.py can import it as
+# the single source of truth for the drift gate threshold.
+ENTRY_MAX_DRIFT = 0.04
 
 
 @dataclass
@@ -69,6 +72,7 @@ class OrderExecutor:
         them as suspicious.
         """
         deadline = time.monotonic() + _FILL_POLL_DEADLINE_SEC
+        fast_until = time.monotonic() + _FILL_POLL_FAST_WINDOW_SEC
         while time.monotonic() < deadline:
             cur_token = await self.clob.get_token_balance(token_id)
             if (
@@ -83,7 +87,8 @@ class OrderExecutor:
                     cost = fallback_cost
                 avg = cost / size if size > 0 else fallback_cost / max(fallback_size, 1e-6)
                 return size, cost, avg, True
-            await asyncio.sleep(_FILL_POLL_INTERVAL_SEC)
+            interval = _FILL_POLL_FAST_SEC if time.monotonic() < fast_until else _FILL_POLL_INTERVAL_SEC
+            await asyncio.sleep(interval)
         # Final read — sometimes the delta lands right after the deadline
         cur_token = await self.clob.get_token_balance(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
@@ -120,6 +125,7 @@ class OrderExecutor:
         actual fill price — log accordingly.
         """
         deadline = time.monotonic() + _FILL_POLL_DEADLINE_SEC
+        fast_until = time.monotonic() + _FILL_POLL_FAST_WINDOW_SEC
         while time.monotonic() < deadline:
             cur_token = await self.clob.get_token_balance(token_id)
             if (
@@ -132,7 +138,8 @@ class OrderExecutor:
                     actual_sold = pre_token - cur_token
                     if actual_sold > 0:
                         return proceeds / actual_sold, proceeds, True
-            await asyncio.sleep(_FILL_POLL_INTERVAL_SEC)
+            interval = _FILL_POLL_FAST_SEC if time.monotonic() < fast_until else _FILL_POLL_INTERVAL_SEC
+            await asyncio.sleep(interval)
         # Final read — sometimes the delta lands right after the deadline
         cur_token = await self.clob.get_token_balance(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
@@ -152,6 +159,49 @@ class OrderExecutor:
             "check Polymarket directly)"
         )
         return fallback_avg, fallback_avg * sold_shares, False
+
+    # ------------------------------------------------------------ background reconcile
+    async def _bg_reconcile_buy(
+        self,
+        token_id: str,
+        pre_token: float,
+        pre_pusd: float,
+        fallback_size: float,
+        fallback_cost: float,
+    ) -> None:
+        """Background task: wait for fill settlement, update position with actual values."""
+        size, cost, avg, reconciled = await self._reconcile_buy(
+            token_id, pre_token, pre_pusd, fallback_size, fallback_cost
+        )
+        pos = self.positions.open.get(token_id)
+        if pos is not None and reconciled:
+            pos.entry_price = avg
+            pos.size_shares = size
+            pos.cost_usd = cost
+        marker = "FILL" if reconciled else "FILL?"
+        log.info(
+            f"[exec] {marker} BUY reconciled: {size:.4f}sh @{avg:.4f} cost=${cost:.4f}"
+            f"{'' if reconciled else ' (ESTIMATE — reconciliation timeout)'}"
+        )
+
+    async def _bg_reconcile_sell(
+        self,
+        token_id: str,
+        pre_token: float,
+        pre_pusd: float,
+        sold_shares: float,
+        fallback_avg: float,
+    ) -> None:
+        """Background task: confirm sell fill price for logging."""
+        avg, proceeds, reconciled = await self._reconcile_sell(
+            token_id, pre_token, pre_pusd, sold_shares, fallback_avg
+        )
+        marker = "CLOSE" if reconciled else "CLOSE?"
+        log.info(
+            f"[exec] {marker} SELL reconciled: {sold_shares:.4f}sh @{avg:.4f} "
+            f"proceeds=${proceeds:.4f}"
+            f"{'' if reconciled else ' (ESTIMATE — reconciliation timeout)'}"
+        )
 
     # ------------------------------------------------------------ buy
     async def buy_to_open(
@@ -183,25 +233,11 @@ class OrderExecutor:
             )
             return FillReport(True, expected_ask, shares, usd_amount, {"dry": True})
 
-        # Validate edge is still intact before placing market order.
-        # Market orders have no price cap so we abort if the ask has drifted
-        # too far from the signal price — prevents buying into a worse entry.
-        fresh_ask = await self.clob.price(token_id, "buy")
-        if fresh_ask is None:
-            log.warning("[exec] buy skipped — cannot verify current ask")
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="ask-fetch-failed")
-        drift = fresh_ask - expected_ask
-        if drift > _MARKET_ENTRY_MAX_DRIFT:
-            log.info(
-                f"[exec] buy aborted — ask drifted {drift:+.3f} "
-                f"(expected={expected_ask:.3f} now={fresh_ask:.3f})"
-            )
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="edge-lost")
-
-        # Snapshot balances before placing order — baseline for delta-based
-        # reconciliation that derives true fill size & price.
+        # Drift already validated in main.py against live WebSocket ask before this call.
+        # Only token balance snapshot needed here — pUSD baseline uses in-memory cache
+        # (refreshed every ~5s via _refresh_bankroll) to avoid a redundant HTTP call.
         pre_token = await self.clob.get_token_balance(token_id) or 0.0
-        pre_pusd = await self.clob.get_usdc_balance() or 0.0
+        pre_pusd = self.clob._bankroll_cache
 
         try:
             resp = await self.clob.place_market_buy(token_id, usd_amount)
@@ -221,8 +257,7 @@ class OrderExecutor:
             self._last_fail_ts = time.time()
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="rejected")
 
-        # Best-effort estimate from the response if balance polling times out.
-        # Real values come from balance delta after settlement.
+        # Best-effort size estimate — updated with exact value by background reconciler.
         raw_taking = resp.get("takingAmount") or resp.get("size")
         expected_size = usd_amount / max(expected_ask, 1e-3)
         if raw_taking:
@@ -232,27 +267,26 @@ class OrderExecutor:
         else:
             est_size = expected_size
 
-        size, cost, avg, reconciled = await self._reconcile_buy(
-            token_id, pre_token, pre_pusd, est_size, usd_amount
-        )
-
+        # Register position immediately so the strategy loop can manage it on the
+        # next tick. Background task updates entry_price/size with reconciled values.
         self.positions.add(
             Position(
                 token_id=token_id,
                 side=side_label,
-                entry_price=avg,
-                size_shares=size,
-                cost_usd=cost,
+                entry_price=expected_ask,
+                size_shares=est_size,
+                cost_usd=usd_amount,
                 market_window_ts=market_window_ts,
             )
         )
-        marker = "FILL" if reconciled else "FILL?"
         log.info(
-            f"[exec] {marker} BUY {side_label} {size:.4f}sh @{avg:.4f} cost=${cost:.4f} "
-            f"(expected_ask={expected_ask:.3f} fresh_ask={fresh_ask:.3f}"
-            f"{'' if reconciled else ' UNRECONCILED'})"
+            f"[exec] BUY SENT {side_label} ${usd_amount:.2f} @≈{expected_ask:.3f} "
+            f"~{est_size:.4f}sh token={token_id[:8]}… — reconciling"
         )
-        return FillReport(True, avg, size, cost, resp, reconciled=reconciled)
+        asyncio.ensure_future(
+            self._bg_reconcile_buy(token_id, pre_token, pre_pusd, est_size, usd_amount)
+        )
+        return FillReport(True, expected_ask, est_size, usd_amount, resp, reconciled=False)
 
     # ------------------------------------------------------------ sell
     async def sell_to_close(
@@ -271,7 +305,7 @@ class OrderExecutor:
                 True, mark_price, pos.size_shares, mark_price * pos.size_shares, {"dry": True}
             )
 
-        # Polymarket is the source of truth for what we hold.
+        # Polymarket is source of truth for held shares; pUSD from cache.
         actual_bal = await self.clob.get_token_balance(token_id)
         if actual_bal is None:
             log.warning("[exec] sell skipped — token balance query failed")
@@ -287,7 +321,7 @@ class OrderExecutor:
             )
             pos.size_shares = actual_bal
 
-        pre_pusd = await self.clob.get_usdc_balance() or 0.0
+        pre_pusd = self.clob._bankroll_cache
 
         try:
             resp = await self.clob.place_market_sell(token_id, pos.size_shares)
@@ -309,14 +343,15 @@ class OrderExecutor:
             self._last_fail_ts = time.time()
             return FillReport(False, 0.0, 0.0, 0.0, resp, error="rejected")
 
-        avg, proceeds, reconciled = await self._reconcile_sell(
-            token_id, actual_bal, pre_pusd, pos.size_shares, mark_price
-        )
-        self.positions.close(token_id, avg)
-        marker = "CLOSE" if reconciled else "CLOSE?"
+        # Close position immediately with mark_price so the strategy loop is
+        # unblocked for the next tick. Background task logs the reconciled fill price.
+        sold_shares = pos.size_shares
+        self.positions.close(token_id, mark_price)
         log.info(
-            f"[exec] {marker} {pos.side} {pos.size_shares:.4f}sh @{avg:.4f} "
-            f"proceeds=${proceeds:.4f} (mark={mark_price:.3f}"
-            f"{'' if reconciled else ' UNRECONCILED'})"
+            f"[exec] SELL SENT {pos.side} {sold_shares:.4f}sh @≈{mark_price:.3f} "
+            f"token={token_id[:8]}… — reconciling"
         )
-        return FillReport(True, avg, pos.size_shares, proceeds, resp, reconciled=reconciled)
+        asyncio.ensure_future(
+            self._bg_reconcile_sell(token_id, actual_bal, pre_pusd, sold_shares, mark_price)
+        )
+        return FillReport(True, mark_price, sold_shares, mark_price * sold_shares, resp, reconciled=False)

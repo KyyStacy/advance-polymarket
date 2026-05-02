@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from .config.settings import Settings, load_settings
-from .execution.order_executor import OrderExecutor
+from .execution.order_executor import ENTRY_MAX_DRIFT, OrderExecutor
 from .execution.position_tracker import Position, PositionTracker
 from .feeds.binance_ws import BinanceFeed
 from .feeds.coinbase_ws import CoinbaseFeed
@@ -339,12 +339,10 @@ class TradingBot:
         if fresh_ask is None or fresh_ask <= 0:
             self.log.info(f"[bot] entry aborted — fresh ask gone for {decision.side}")
             return
-        ask_drift = (fresh_ask - decision_ask) / max(decision_ask, 1e-3)
-        # Allow 3% upward drift (still inside our 3¢ slippage cap on a 0.50+ ask).
-        # Beyond that, the book has moved enough that our edge calc is stale.
-        if ask_drift > 0.03:
+        ask_drift = fresh_ask - decision_ask
+        if ask_drift > ENTRY_MAX_DRIFT:
             self.log.info(
-                f"[bot] entry aborted — ask drifted {ask_drift:+.1%} "
+                f"[bot] entry aborted — ask drifted ${ask_drift:+.4f} "
                 f"({decision_ask:.3f} → {fresh_ask:.3f})"
             )
             return
@@ -442,26 +440,28 @@ class TradingBot:
                 remain = max(0, (self.oracle.bucket_start_ms + self.oracle.interval_ms - now_ms) // 1000)
 
                 if self.oracle.bucket_start_ms > 0:
-                    start_dt = datetime.fromtimestamp(self.oracle.bucket_start_ms / 1000)
-                    end_dt = datetime.fromtimestamp((self.oracle.bucket_start_ms + self.oracle.interval_ms) / 1000)
-                    wib_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} WIB"
-
-                    # ET range — convert UTC times to ET
+                    from datetime import timezone
+                    _utc = timezone.utc
+                    _wib = timezone(timedelta(hours=7))
+                    start_utc = datetime.fromtimestamp(self.oracle.bucket_start_ms / 1000, tz=_utc)
+                    end_utc = datetime.fromtimestamp((self.oracle.bucket_start_ms + self.oracle.interval_ms) / 1000, tz=_utc)
+                    wib_range = (
+                        f"{start_utc.astimezone(_wib).strftime('%H:%M')} - "
+                        f"{end_utc.astimezone(_wib).strftime('%H:%M')} WIB"
+                    )
                     try:
                         from zoneinfo import ZoneInfo
                         et_tz = ZoneInfo("America/New_York")
-                        start_et = start_dt.replace(tzinfo=None).astimezone(et_tz)
-                        end_et = end_dt.replace(tzinfo=None).astimezone(et_tz)
-                        et_range = f"{start_et.strftime('%H:%M')} - {end_et.strftime('%H:%M')} ET"
+                        et_range = (
+                            f"{start_utc.astimezone(et_tz).strftime('%H:%M')} - "
+                            f"{end_utc.astimezone(et_tz).strftime('%H:%M')} ET"
+                        )
                     except Exception:
-                        # Fallback: convert using UTC offset
                         et_offset = get_et_offset()
-                        start_utc = datetime.utcfromtimestamp(self.oracle.bucket_start_ms / 1000)
-                        end_utc = datetime.utcfromtimestamp((self.oracle.bucket_start_ms + self.oracle.interval_ms) / 1000)
-                        start_et = start_utc + timedelta(hours=et_offset)
-                        end_et = end_utc + timedelta(hours=et_offset)
-                        et_range = f"{start_et.strftime('%H:%M')} - {end_et.strftime('%H:%M')} ET"
-
+                        et_range = (
+                            f"{(start_utc + timedelta(hours=et_offset)).strftime('%H:%M')} - "
+                            f"{(end_utc + timedelta(hours=et_offset)).strftime('%H:%M')} ET"
+                        )
                     time_range = f"{wib_range} | {et_range}"
                 else:
                     time_range = "WAITING..."
@@ -506,8 +506,6 @@ class TradingBot:
                 else:
                     win_rate_str = "0.0%"
 
-                open_count = len(self.positions.open)
-
                 CLR = "\033[K"
                 line_heavy = f"{C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{X}"
                 line_light = f"{C}────────────────────────────────────────────────────────────────{X}"
@@ -533,20 +531,19 @@ class TradingBot:
                         table.append(f" {Y}{B}ACTIVE POSITION{X} : {G}{pos_str}{X}" + CLR)
 
                 table.append(line_heavy + CLR)
-                local_time = datetime.now().strftime('%H:%M:%S')
-                # ET time — try ZoneInfo, fallback to auto-detect EDT/EST
+                from datetime import timezone
+                wib_now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=7)))
+                wib_time = wib_now.strftime('%H:%M:%S')
                 try:
                     from zoneinfo import ZoneInfo
                     et_time = datetime.now(ZoneInfo("America/New_York")).strftime('%H:%M:%S')
                 except Exception:
-                    # Fallback: use auto-detect function
                     et_offset = get_et_offset()
-                    utc_now = datetime.utcnow()
-                    et_time = (utc_now + timedelta(hours=et_offset)).strftime('%H:%M:%S')
+                    et_time = (datetime.now(timezone.utc) + timedelta(hours=et_offset)).strftime('%H:%M:%S')
                 table.append(
-                    f" {Y}{local_time} WIB | {et_time} ET{X}"
+                    f" {Y}{wib_time} WIB | {et_time} ET{X}"
                     f" | PNL: {pnl_str}"
-                    f" | {B}Pos:{X} {open_count}"
+                    f" | {B}Trades:{X} {total_trades}"
                     f" | {B}WR:{X} {win_rate_str}"
                     + CLR
                 )
