@@ -1,0 +1,10 @@
+py-clob-client-v2>=1.0.0
+web3>=6.20.0
+websockets>=12.0
+aiohttp>=3.9.0
+python-dotenv>=1.0.1
+loguru>=0.7.2
+numpy>=1.26.0
+pydantic>=2.6.0
+orjson>=3.9.10
+tenacity>=8.2.3

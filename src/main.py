@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import asyncio
+import time
+
+from .config.settings import Settings, load_settings
+from .execution.order_executor import OrderExecutor
+from .execution.position_tracker import Position, PositionTracker
+from .feeds.binance_ws import BinanceFeed
+from .feeds.coinbase_ws import CoinbaseFeed
+from .feeds.polymarket_rtds import PolymarketRtdsFeed
+from .feeds.polymarket_ws import PolymarketBookFeed
+from .feeds.price_aggregator import PriceAggregator
+from .market.clob_client import PolymarketClobClient
+from .market.discovery import MarketDiscovery, MarketInfo
+from .market.redeemer import PositionRedeemer
+from .risk.manager import RiskManager
+from .signals.lead_lag import LeadLagDetector
+from .signals.mispricing import MispricingEvaluator
+from .signals.momentum import MomentumAnalyzer
+from .strategy.entry_engine import EntryEngine
+from .strategy.exit_engine import ExitEngine
+from .utils.logger import get_logger, setup_logger
+from .utils.time_utils import (
+    current_window_start,
+    seconds_into_window,
+    seconds_left_in_window,
+)
+
+# Refresh bankroll every N ticks (400ms/tick → ~40s refresh)
+_BANKROLL_REFRESH_TICKS = 100
+
+
+class TradingBot:
+    def __init__(self, settings: Settings | None = None):
+        self.s = settings or load_settings()
+        setup_logger(self.s.log_level, self.s.log_file, console=False)
+        self.log = get_logger()
+
+        self.agg = PriceAggregator()
+
+        self.binance = BinanceFeed(self.agg.on_cex)
+        self.coinbase = CoinbaseFeed(self.agg.on_cex)
+        self.oracle = PolymarketRtdsFeed(
+            on_update=self.agg.on_oracle,
+            symbol="btc/usd",
+        )
+
+        self.poly_book = PolymarketBookFeed(
+            self.s.polymarket_ws, token_ids=[], on_book=self._on_poly_book
+        )
+        self._poly_books: dict[str, dict] = {}
+
+        self.discovery = MarketDiscovery(self.s.gamma_host)
+        self.clob = PolymarketClobClient(self.s)
+        self.redeemer = PositionRedeemer(self.s.polygon_rpc, self.s.private_key)
+
+        self.momentum = MomentumAnalyzer(self.agg)
+        self.leadlag = LeadLagDetector(self.agg)
+        self.mispricing = MispricingEvaluator()
+
+        self.entry_engine = EntryEngine(self.s)
+        self.exit_engine = ExitEngine(self.s)
+
+        self.positions = PositionTracker()
+        self.executor = OrderExecutor(self.s, self.clob, self.positions)
+        self.risk = RiskManager(self.s)
+
+        self._stop = asyncio.Event()
+        self._current_market: MarketInfo | None = None
+        # Anchor price is now derived exclusively from Chainlink RTDS
+        # candle open — no fallback to CEX.  Updated each time a new bucket
+        # boundary is detected by oracle.candle_ready.
+        self._anchor_price: float | None = None
+        self._anchor_bucket_ms: int = -1  # bucket_start_ms when anchor was locked
+        self._tick_count: int = 0
+        # Polymarket taker fee — fixed at 2% (matches their published rate for prediction markets)
+        self._taker_fee_rate: float = 0.02
+
+        # Track positions held through window end (pending redemption)
+        self._pending_redeem: list[tuple[str, str, str]] = []  # (condition_id, side, token_id)
+        # Dedup key for signal logging — only log when signal state changes
+        self._last_signal_key: str = ""
+
+    # ------------------------------------------------------------------ feeds
+    def _on_poly_book(
+        self, token_id: str, ts: float, bid: float | None, ask: float | None
+    ) -> None:
+        self._poly_books[token_id] = {"bid": bid, "ask": ask, "ts": ts}
+
+    # ------------------------------------------------------------------ anchor / window
+    def _try_lock_anchor(self) -> bool:
+        """Lock anchor price from Chainlink RTDS candle open.
+
+        Called each tick.  Returns True once the oracle has reported a valid
+        candle open for the current wall-clock bucket (oracle.candle_ready).
+        No CEX fallback — Chainlink is the single source of truth for
+        Polymarket resolution pricing.
+
+        Mirrors the MonitorState pattern from rtds_example.py: the strategy
+        stays in "WAITING" state until the first Chainlink tick of the new
+        bucket sets the candle open.
+        """
+        if not self.oracle.candle_ready:
+            return False
+
+        bucket_ms = self.oracle.bucket_start_ms
+        # Already locked for this bucket — no update needed.
+        if bucket_ms == self._anchor_bucket_ms:
+            return True
+
+        anchor = self.oracle.current_candle_open
+        if anchor <= 0:
+            return False
+
+        self._anchor_price = anchor
+        self._anchor_bucket_ms = bucket_ms
+        self.log.info(
+            f"[bot] anchor LOCKED (chainlink candle-open) "
+            f"bucket={bucket_ms} price={anchor:.2f} "
+            f"ticks={self.oracle.tick_count} status={self.oracle.status}"
+        )
+        return True
+
+    async def _switch_to_window(self, window_ts: int) -> None:
+        market = await self.discovery.get_current_market(window_ts + 1)
+        if market is None:
+            self.log.warning(f"[bot] no market for window {window_ts} — slug not found in Gamma")
+            self._current_market = None
+            return
+        self._current_market = market
+        self.poly_book.update_tokens(market.tokens)
+        self.log.info(
+            f"[bot] tracking market {market.slug} cond={market.condition_id[:10]}…"
+        )
+        # Anchor will be locked by _try_lock_anchor() on the first
+        # _tick() call once oracle.candle_ready becomes True.
+        # No blocking wait, no CEX fallback.
+
+    # ------------------------------------------------------------------ data helpers
+    def _ask_for(self, token_id: str) -> float | None:
+        b = self._poly_books.get(token_id)
+        return b["ask"] if b else None
+
+    def _bid_for(self, token_id: str) -> float | None:
+        b = self._poly_books.get(token_id)
+        return b["bid"] if b else None
+
+    # ------------------------------------------------------------------ bankroll
+    async def _refresh_bankroll(self) -> None:
+        if self.s.dry_run:
+            if self.risk.bankroll_usd == 0.0:
+                self.risk.update_bankroll(100.0)
+            return
+        bal = await self.clob.get_usdc_balance()
+        if bal is not None and bal > 0:
+            old = self.risk.bankroll_usd
+            self.risk.update_bankroll(bal)
+            if abs(bal - old) > 0.01:
+                self.log.info(f"[bot] bankroll updated: ${bal:.2f}")
+        elif self.risk.bankroll_usd == 0.0:
+            # Balance unavailable — fall back to MAX_BET_USD so sizing still works
+            if self.s.max_bet_mode == "pct":
+                self.log.warning(
+                    "[bot] USDC balance unavailable and MAX_BET_MODE=pct — "
+                    f"falling back to MAX_BET_USD=${self.s.max_bet_usd:.2f} as bankroll estimate"
+                )
+                self.risk.update_bankroll(self.s.max_bet_usd * 20)  # assume 5% of bankroll
+            else:
+                self.risk.update_bankroll(self.s.max_bet_usd * 4)  # minimal sentinel
+
+    # ------------------------------------------------------------------ auto-claim
+    async def _process_pending_redeems(self) -> None:
+        if not self.s.auto_claim or self.s.dry_run or not self._pending_redeem:
+            return
+        still_pending: list[tuple[str, str, str]] = []
+        for cond_id, side, token_id in self._pending_redeem:
+            ok = await self.redeemer.redeem(cond_id, side)
+            if not ok:
+                still_pending.append((cond_id, side, token_id))
+        self._pending_redeem = still_pending
+
+    # ------------------------------------------------------------------ window close
+    async def _resolve_window(self, market: MarketInfo) -> None:
+        """Handle end-of-window for positions that survived through resolution.
+
+        Signal-based exits should have already closed the position. If one remains
+        it means the exit signal never fired — the position will be settled on-chain
+        by Polymarket. If AUTO_CLAIM=true, queue it for redemption.
+        """
+        leftover = self.positions.get_for_window(market.window_ts)
+        if leftover is None:
+            return
+
+        mark = self._bid_for(leftover.token_id)
+        # Only try to sell if we're still inside an active window and there's a live bid
+        if mark and mark > 0.01:
+            self.log.info(
+                f"[bot] PRE-RESOLUTION SELL {leftover.side} {leftover.size_shares:.2f}sh "
+                f"@bid={mark:.3f} window={market.window_ts}"
+            )
+            await self.executor.sell_to_close(leftover.token_id, mark)
+            if self.positions.closed:
+                self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+        else:
+            # No liquid exit — position goes to on-chain resolution
+            # Mark as pending redemption; update PnL after claim
+            self.log.info(
+                f"[bot] HOLDING TO RESOLUTION {leftover.side} "
+                f"cond={market.condition_id[:10]}… — queued for auto-claim"
+            )
+            if self.s.auto_claim and market.condition_id:
+                self._pending_redeem.append(
+                    (market.condition_id, leftover.side, leftover.token_id)
+                )
+            self.positions.open.pop(leftover.token_id, None)
+
+    # ------------------------------------------------------------------ main tick
+    async def _tick(self) -> None:
+        m = self._current_market
+        if m is None:
+            return
+
+        # ---- Bucket-aware anchor management (MonitorState pattern) ----
+        # Try to lock anchor on every tick.  If the oracle hasn't delivered
+        # the first Chainlink tick of this bucket yet, skip strategy work.
+        if not self._try_lock_anchor():
+            return
+        if self._anchor_price is None:
+            return
+
+        now = time.time()
+        sec_in = seconds_into_window(now)
+        sec_left = seconds_left_in_window(now)
+        cex = self.agg.latest_cex()
+        if cex is None:
+            return
+
+        # Periodically refresh bankroll
+        self._tick_count += 1
+        if self._tick_count % _BANKROLL_REFRESH_TICKS == 1:
+            await self._refresh_bankroll()
+            await self._process_pending_redeems()
+
+        mom = self.momentum.read(now)
+        ll = self.leadlag.read(now)
+        up_ask = self._ask_for(m.up_token_id)
+        down_ask = self._ask_for(m.down_token_id)
+        up_bid = self._bid_for(m.up_token_id)
+        down_bid = self._bid_for(m.down_token_id)
+
+        misp = self.mispricing.evaluate(
+            anchor_price=self._anchor_price,
+            current_cex=cex[1],
+            seconds_left=sec_left,
+            momentum=mom,
+            leadlag=ll,
+            implied_p_up_ask=up_ask,
+            implied_p_down_ask=down_ask,
+            fee_rate=self._taker_fee_rate,
+        )
+
+        # ---- manage existing position ----
+        existing = self.positions.get_for_window(m.window_ts)
+        if existing is not None:
+            mark = (up_bid if existing.side == "UP" else down_bid) or existing.entry_price
+            unreal_pct = (mark - existing.entry_price) / max(existing.entry_price, 1e-3)
+            seconds_held = now - existing.opened_at
+            ed = self.exit_engine.decide(
+                existing.side, sec_left, mom, ll, misp, unreal_pct, seconds_held
+            )
+            if ed.exit:
+                self.log.info(
+                    f"[bot] EXIT {existing.side} mark={mark:.3f} "
+                    f"unreal={unreal_pct:+.1%} held={seconds_held:.0f}s reason={ed.reason}"
+                )
+                await self.executor.sell_to_close(existing.token_id, mark)
+                if self.positions.closed:
+                    self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+            return
+
+        # ---- no position: check entry ----
+        ok, why = self.risk.can_trade()
+        if not ok:
+            self.log.debug(f"[bot] skip entry: {why}")
+            return
+
+        # Skip entry attempt entirely if executor is still cooling down after a failure.
+        # The next tick will re-evaluate signals fresh — no log spam, no stale prices.
+        if self.executor.in_cooldown():
+            return
+
+        decision = self.entry_engine.decide(
+            seconds_into_window=sec_in,
+            seconds_left=sec_left,
+            momentum=mom,
+            leadlag=ll,
+            mispricing=misp,
+            up_ask=up_ask,
+            down_ask=down_ask,
+            up_bid=up_bid,
+            down_bid=down_bid,
+            up_token_id=m.up_token_id,
+            down_token_id=m.down_token_id,
+        )
+
+        # Log signal state — only when it changes to avoid spam.
+        # Fires whenever mispricing finds a non-zero edge on either side.
+        if misp is not None and misp.side is not None:
+            sig_key = f"{misp.side}:{decision.enter}:{decision.reason}"
+            if sig_key != self._last_signal_key:
+                self._last_signal_key = sig_key
+                ask_val = (up_ask if misp.side == "UP" else down_ask) or 0.0
+                ll_part = f" ll={ll.deviation_bps:.1f}bps" if ll else ""
+                result = "ACCEPTED" if decision.enter else f"REJECTED ({decision.reason})"
+                self.log.info(
+                    f"[signal] {misp.side:4s} ask={ask_val:.3f} edge={misp.edge:.3f}"
+                    f" z={mom.z_score:.2f}{ll_part} → {result}"
+                )
+        else:
+            self._last_signal_key = ""
+
+        if not decision.enter:
+            return
+
+        size_usd = self.risk.position_size_usd(decision.edge, decision.implied_ask or 0.5)
+        if size_usd < self.s.min_bet_usd:
+            self.log.debug(
+                f"[bot] size_usd={size_usd:.2f} < min_bet={self.s.min_bet_usd} — skip"
+            )
+            return
+
+        # Pre-trade re-validation — re-fetch the ask just before sending the
+        # order. The book may have moved since the entry decision was made
+        # (especially when momentum is firing). If the ask has drifted beyond
+        # tolerance, abort and let the next tick re-evaluate from fresh data.
+        decision_ask = decision.implied_ask or 0.5
+        fresh_ask = self._ask_for(decision.token_id or "")
+        if fresh_ask is None or fresh_ask <= 0:
+            self.log.info(f"[bot] entry aborted — fresh ask gone for {decision.side}")
+            return
+        ask_drift = (fresh_ask - decision_ask) / max(decision_ask, 1e-3)
+        # Allow 3% upward drift (still inside our 3¢ slippage cap on a 0.50+ ask).
+        # Beyond that, the book has moved enough that our edge calc is stale.
+        if ask_drift > 0.03:
+            self.log.info(
+                f"[bot] entry aborted — ask drifted {ask_drift:+.1%} "
+                f"({decision_ask:.3f} → {fresh_ask:.3f})"
+            )
+            return
+        # Use the fresher ask for execution so the slippage cap reflects reality.
+        execution_ask = fresh_ask
+
+        ll_str = f" ll={ll.deviation_bps:.1f}bps" if ll else ""
+        fee_str = f" fee={self._taker_fee_rate:.2%}" if self._taker_fee_rate else ""
+        self.log.info(
+            f"[bot] ENTRY {decision.side} ${size_usd:.2f} "
+            f"ask={execution_ask:.3f} edge={decision.edge:.3f} "
+            f"z={mom.z_score:.2f}{ll_str}{fee_str}"
+        )
+        await self.executor.buy_to_open(
+            token_id=decision.token_id or "",
+            side_label=decision.side or "?",
+            usd_amount=size_usd,
+            expected_ask=execution_ask,
+            market_window_ts=m.window_ts,
+        )
+
+    # ------------------------------------------------------------------ loop
+    async def _strategy_loop(self) -> None:
+        # Wait for CEX feeds to warm up so momentum has data to work with.
+        # RTDS runs in parallel — we don't block on it here because:
+        #  1. _tick() already gates on candle_ready (oracle.status == LIVE)
+        #  2. rtds_example.py doesn't wait either — it streams and reacts
+        for i in range(40):
+            if self.agg.latest_cex() is not None:
+                break
+            if i == 20:
+                self.log.warning("[bot] warm-up: CEX feeds slow to connect")
+            await asyncio.sleep(0.5)
+        self.log.info(
+            "[bot] feeds ready — RTDS status=%s candle_ready=%s — entering strategy loop",
+            self.oracle.status, self.oracle.candle_ready,
+        )
+
+        await self._refresh_bankroll()
+
+        last_window = -1
+        while not self._stop.is_set():
+            now = time.time()
+            win = current_window_start(now)
+            if win != last_window:
+                if last_window > 0 and self._current_market is not None:
+                    await self._resolve_window(self._current_market)
+                # Reset anchor bucket so _try_lock_anchor() will re-lock
+                # the candle open on the first Chainlink tick of the new window.
+                self._anchor_bucket_ms = -1
+                self._anchor_price = None
+                await self._switch_to_window(win)
+                last_window = win
+            try:
+                await self._tick()
+            except Exception as e:
+                self.log.exception(f"[bot] tick error: {e}")
+            # Evaluasi strategi dijalankan dengan interval sangat rapat (50ms)
+            # agar reaksi terhadap perubahan harga (mispricing/lead-lag) nyaris instan.
+            await asyncio.sleep(0.05)
+
+    async def _display_loop(self) -> None:
+        """
+        Loop asinkron untuk memperbarui tampilan terminal / antarmuka secara terus menerus.
+        Berjalan independen tanpa memblokir WebSocket atau Strategy.
+        """
+        import sys
+        from datetime import datetime, timedelta
+
+        def get_et_offset() -> int:
+            """Auto-detect EDT (UTC-4) or EST (UTC-5) based on current date."""
+            now = datetime.now()
+            month, day = now.month, now.day
+            weekday = now.weekday()  # 0=Mon, 6=Sun
+
+            is_edt = False
+            if month > 3 and month < 11:  # Apr-Oct: always EDT
+                is_edt = True
+            elif month == 3:  # March: EDT after 2nd Sunday (~8-14)
+                is_edt = day > 14 or (day > 7 and weekday == 6)
+            elif month == 11:  # Nov: EST after 1st Sunday (~1-7)
+                is_edt = day < 7 and weekday != 6
+
+            return -4 if is_edt else -5
+
+        G, R, Y, B, C, X = "\033[92m", "\033[91m", "\033[93m", "\033[1m", "\033[96m", "\033[0m"
+
+        sys.stdout.write("\033[?25l\033[2J\033[H")
+
+        try:
+            while not self._stop.is_set():
+                sys.stdout.write("\033[H")
+
+                now_ms = int(time.time() * 1000)
+                remain = max(0, (self.oracle.bucket_start_ms + self.oracle.interval_ms - now_ms) // 1000)
+
+                if self.oracle.bucket_start_ms > 0:
+                    start_dt = datetime.fromtimestamp(self.oracle.bucket_start_ms / 1000)
+                    end_dt = datetime.fromtimestamp((self.oracle.bucket_start_ms + self.oracle.interval_ms) / 1000)
+                    wib_range = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')} WIB"
+
+                    # ET range — convert UTC times to ET
+                    try:
+                        from zoneinfo import ZoneInfo
+                        et_tz = ZoneInfo("America/New_York")
+                        start_et = start_dt.replace(tzinfo=None).astimezone(et_tz)
+                        end_et = end_dt.replace(tzinfo=None).astimezone(et_tz)
+                        et_range = f"{start_et.strftime('%H:%M')} - {end_et.strftime('%H:%M')} ET"
+                    except Exception:
+                        # Fallback: convert using UTC offset
+                        et_offset = get_et_offset()
+                        start_utc = datetime.utcfromtimestamp(self.oracle.bucket_start_ms / 1000)
+                        end_utc = datetime.utcfromtimestamp((self.oracle.bucket_start_ms + self.oracle.interval_ms) / 1000)
+                        start_et = start_utc + timedelta(hours=et_offset)
+                        end_et = end_utc + timedelta(hours=et_offset)
+                        et_range = f"{start_et.strftime('%H:%M')} - {end_et.strftime('%H:%M')} ET"
+
+                    time_range = f"{wib_range} | {et_range}"
+                else:
+                    time_range = "WAITING..."
+                
+                # Chainlink price
+                if self.oracle.latest_price > 0:
+                    chainlink_str = f"${self.oracle.latest_price:,.2f}"
+                else:
+                    chainlink_str = f"{Y}WAITING...{X}"
+
+                # Binance & Coinbase — read directly from feed's last_mid (updated every WS event)
+                binance_str = (
+                    f"${self.binance.last_mid:,.2f}" if self.binance.last_mid
+                    else f"{Y}WAITING...{X}"
+                )
+                coinbase_str = (
+                    f"${self.coinbase.last_mid:,.2f}" if self.coinbase.last_mid
+                    else f"{Y}WAITING...{X}"
+                )
+
+                if self.oracle.current_candle_open > 0:
+                    price_to_beat_str = f"${self.oracle.current_candle_open:,.2f}"
+                    diff = self.oracle.latest_price - self.oracle.current_candle_open
+                    color = G if diff > 0 else (R if diff < 0 else X)
+                    dir_icon = "ABOVE ▲" if diff > 0 else ("BELOW ▼" if diff < 0 else "FLAT ■")
+                    diff_str = f"{color}{diff:+.2f}{X}"
+                    status_str = f"{color}{B}{dir_icon}{X}"
+                else:
+                    price_to_beat_str = f"{Y}WAITING...{X}"
+                    diff_str = f"{Y}WAITING...{X}"
+                    status_str = f"{Y}{B}WAITING NEXT CANDLE{X}"
+
+                pnl_val = self.risk.pnl.realized
+                pnl_str = f"{G if pnl_val >= 0 else R}{pnl_val:+.2f}{X}"
+                interval_min = int(self.oracle.interval_ms / 60000)
+                next_candle_val = f"{int(remain//60):02d}:{int(remain%60):02d} | {self.oracle.status}"
+
+                total_trades = len(self.positions.closed)
+                if total_trades > 0:
+                    wins = sum(1 for p in self.positions.closed if p.realized_pnl > 0)
+                    win_rate_str = f"{wins/total_trades*100:.1f}%"
+                else:
+                    win_rate_str = "0.0%"
+
+                open_count = len(self.positions.open)
+
+                CLR = "\033[K"
+                line_heavy = f"{C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{X}"
+                line_light = f"{C}────────────────────────────────────────────────────────────────{X}"
+
+                table = [
+                    line_heavy + CLR,
+                    f" {B}POLYMARKET BTC-{interval_min}M{X} | {Y}{time_range}{X}" + CLR,
+                    line_light + CLR,
+                    f" {B}BINANCE   {X} : {binance_str}" + CLR,
+                    f" {B}COINBASE  {X} : {coinbase_str}" + CLR,
+                    line_light + CLR,
+                    f" {B}CURRENT PRICE {X}: {B}{chainlink_str}{X}" + CLR,
+                    f" {B}PRICE TO BEAT{X} : {B}{price_to_beat_str}{X}" + CLR,
+                    f" {B}DIFFERENCE   {X} : {diff_str}" + CLR,
+                    f" {B}STATUS       {X} : {status_str}" + CLR,
+                    f" {B}NEXT CANDLE  {X} : {Y}{next_candle_val}{X}" + CLR,
+                ]
+
+                if self.positions.open:
+                    table.append(line_light + CLR)
+                    for pos in self.positions.open.values():
+                        pos_str = f"BUY {pos.side} | {pos.size_shares:.1f} sh @ ${pos.entry_price:.2f}"
+                        table.append(f" {Y}{B}ACTIVE POSITION{X} : {G}{pos_str}{X}" + CLR)
+
+                table.append(line_heavy + CLR)
+                local_time = datetime.now().strftime('%H:%M:%S')
+                # ET time — try ZoneInfo, fallback to auto-detect EDT/EST
+                try:
+                    from zoneinfo import ZoneInfo
+                    et_time = datetime.now(ZoneInfo("America/New_York")).strftime('%H:%M:%S')
+                except Exception:
+                    # Fallback: use auto-detect function
+                    et_offset = get_et_offset()
+                    utc_now = datetime.utcnow()
+                    et_time = (utc_now + timedelta(hours=et_offset)).strftime('%H:%M:%S')
+                table.append(
+                    f" {Y}{local_time} WIB | {et_time} ET{X}"
+                    f" | PNL: {pnl_str}"
+                    f" | {B}Pos:{X} {open_count}"
+                    f" | {B}WR:{X} {win_rate_str}"
+                    + CLR
+                )
+                table.append(CLR)
+                table.append(CLR)
+                
+                sys.stdout.write("\n".join(table) + "\n")
+                sys.stdout.flush()
+                
+                await asyncio.sleep(0.2)
+        finally:
+            import sys
+            sys.stdout.write("\033[?25h\n")
+
+    # ------------------------------------------------------------------ run
+    async def run(self) -> None:
+        self.log.info(
+            f"[bot] starting | DRY_RUN={self.s.dry_run} "
+            f"odds=[{self.s.min_odds},{self.s.max_odds}] "
+            f"max_daily_loss=${self.s.max_daily_loss_usd}"
+        )
+        await asyncio.gather(
+            self.binance.start(),
+            self.coinbase.start(),
+            self.oracle.start(),
+            self.poly_book.start(),
+        )
+        if not self.s.dry_run:
+            try:
+                await self.clob.ensure_ready()
+            except Exception as e:
+                self.log.error(f"[bot] CLOB init failed: {e} — forcing dry-run")
+                self.s.dry_run = True
+
+        try:
+            display_task = asyncio.create_task(self._display_loop())
+            await self._strategy_loop()
+        finally:
+            self._stop.set()
+            await asyncio.gather(
+                self.binance.stop(),
+                self.coinbase.stop(),
+                self.oracle.stop(),
+                self.poly_book.stop(),
+                return_exceptions=True,
+            )
+            await self.discovery.close()
+            self.log.info(
+                f"[bot] stopped | trades={self.risk.pnl.n_trades} "
+                f"realized_pnl={self.risk.pnl.realized:+.2f}"
+            )

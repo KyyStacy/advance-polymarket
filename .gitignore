@@ -1,0 +1,132 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env_backup
+
+# Secrets & config
+.env
+.env.local
+.env.*.local
+config.local.py
+# .env.example is intentionally tracked
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+.pytest_cache/
+coverage.xml
+
+# IDE
+.vscode/
+.vscode/extensions/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+.project
+.settings/
+*.sublime-workspace
+.vscode-server/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+pyrightconfig.json
+
+# Distribution
+*.whl
+*.tar.gz
+MANIFEST
+.claude/settings.local.json
+
+# Data files (trading/model data)
+*.csv
+*.json
+*.pickle
+*.pkl
+*.parquet
+data/
+datasets/
+models/
+weights/
+checkpoints/
+*.h5
+*.pt
+*.pth
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache & temp
+.cache/
+*.cache
+tmp/
+temp/
+*.tmp
+*~
+
+# OS temp files
+.AppleDouble
+.LSOverride
+Network Trash Folder
+Temporary Items
+
+# Package managers
+Pipfile.lock
+poetry.lock
+pdm.lock
+pip.log
+
+# Performance
+*.prof
+.profile
+perf.data
+
+# Development artifacts
+.dev/
+debug/
+test_output/
+results/
