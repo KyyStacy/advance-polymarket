@@ -81,6 +81,7 @@ class TradingBot:
         self._pending_redeem: list[tuple[str, str, str]] = []  # (condition_id, side, token_id)
         # Dedup key for signal logging — only log when signal state changes
         self._last_signal_key: str = ""
+        self._start_time: float = time.time()
 
     # ------------------------------------------------------------------ feeds
     def _on_poly_book(
@@ -409,6 +410,7 @@ class TradingBot:
         Loop asinkron untuk memperbarui tampilan terminal / antarmuka secara terus menerus.
         Berjalan independen tanpa memblokir WebSocket atau Strategy.
         """
+        import re as _re
         import sys
         from datetime import datetime, timedelta
 
@@ -499,6 +501,11 @@ class TradingBot:
                 interval_min = int(self.oracle.interval_ms / 60000)
                 next_candle_val = f"{int(remain//60):02d}:{int(remain%60):02d} | {self.oracle.status}"
 
+                bal = self.risk.bankroll_usd
+                bal_str = f"${bal:.2f}" if bal > 0 else f"{Y}--{X}"
+                elapsed = int(time.time() - self._start_time)
+                run_str = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
+
                 total_trades = len(self.positions.closed)
                 if total_trades > 0:
                     wins = sum(1 for p in self.positions.closed if p.realized_pnl > 0)
@@ -506,31 +513,6 @@ class TradingBot:
                 else:
                     win_rate_str = "0.0%"
 
-                CLR = "\033[K"
-                line_heavy = f"{C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{X}"
-                line_light = f"{C}────────────────────────────────────────────────────────────────{X}"
-
-                table = [
-                    line_heavy + CLR,
-                    f" {B}POLYMARKET BTC-{interval_min}M{X} | {Y}{time_range}{X}" + CLR,
-                    line_light + CLR,
-                    f" {B}BINANCE   {X} : {binance_str}" + CLR,
-                    f" {B}COINBASE  {X} : {coinbase_str}" + CLR,
-                    line_light + CLR,
-                    f" {B}CURRENT PRICE {X}: {B}{chainlink_str}{X}" + CLR,
-                    f" {B}PRICE TO BEAT{X} : {B}{price_to_beat_str}{X}" + CLR,
-                    f" {B}DIFFERENCE   {X} : {diff_str}" + CLR,
-                    f" {B}STATUS       {X} : {status_str}" + CLR,
-                    f" {B}NEXT CANDLE  {X} : {Y}{next_candle_val}{X}" + CLR,
-                ]
-
-                if self.positions.open:
-                    table.append(line_light + CLR)
-                    for pos in self.positions.open.values():
-                        pos_str = f"BUY {pos.side} | {pos.size_shares:.1f} sh @ ${pos.entry_price:.2f}"
-                        table.append(f" {Y}{B}ACTIVE POSITION{X} : {G}{pos_str}{X}" + CLR)
-
-                table.append(line_heavy + CLR)
                 from datetime import timezone
                 wib_now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=7)))
                 wib_time = wib_now.strftime('%H:%M:%S')
@@ -540,15 +522,64 @@ class TradingBot:
                 except Exception:
                     et_offset = get_et_offset()
                     et_time = (datetime.now(timezone.utc) + timedelta(hours=et_offset)).strftime('%H:%M:%S')
-                table.append(
-                    f" {Y}{wib_time} WIB | {et_time} ET{X}"
-                    f" | PNL: {pnl_str}"
-                    f" | {B}Trades:{X} {total_trades}"
-                    f" | {B}WR:{X} {win_rate_str}"
-                    + CLR
-                )
-                table.append(CLR)
-                table.append(CLR)
+
+                _ansi_strip = _re.compile(r'\033\[[0-9;]*m')
+
+                def vlen(s: str) -> int:
+                    return len(_ansi_strip.sub('', s))
+
+                def row2(left: str, right: str, lw: int = 32) -> str:
+                    pad = ' ' * max(0, lw - vlen(left))
+                    return f" {left}{pad}{right}" + CLR
+
+                W = 64
+                CLR = "\033[K"
+                H = f"{C}{'━' * W}{X}"
+                D = f"{C}{'─' * W}{X}"
+
+                countdown = f"{int(remain//60):02d}:{int(remain%60):02d}"
+
+                table = [
+                    H + CLR,
+                    f" {B}POLYMARKET BTC-{interval_min}M{X}  ·  {Y}{time_range}{X}" + CLR,
+                    D + CLR,
+                    row2(f"{C}Binance {X} {binance_str}",  f"{C}Price {X}{B}{chainlink_str}{X}"),
+                    row2(f"{C}Coinbase{X} {coinbase_str}", f"{C}Open  {X}{B}{price_to_beat_str}{X}"),
+                    row2("",                               f"{C}Diff  {X}{diff_str}  {status_str}"),
+                    D + CLR,
+                    f" {B}Next Candle{X}  {Y}{countdown}{X}  ·  {Y}{self.oracle.status}{X}" + CLR,
+                ]
+
+                if self.positions.open:
+                    table.append(D + CLR)
+                    for pos in self.positions.open.values():
+                        mark = self._bid_for(pos.token_id) or pos.entry_price
+                        unreal = (mark - pos.entry_price) * pos.size_shares
+                        ucol = G if unreal >= 0 else R
+                        left = (
+                            f" {G}▶ {pos.side}{X}"
+                            f"  {pos.size_shares:.2f} sh"
+                            f"  entry ${pos.entry_price:.3f}"
+                            f"  unreal {ucol}{unreal:+.4f}{X}"
+                        )
+                        tag = f"{Y}{B}[OPEN]{X}"
+                        pad = ' ' * max(1, W - vlen(left) - vlen(tag))
+                        table.append(f"{left}{pad}{tag}" + CLR)
+
+                table += [
+                    H + CLR,
+                    (
+                        f" {B}Bal{X} {bal_str}  "
+                        f"{B}P&L{X} {pnl_str}  "
+                        f"{B}Trades{X} {total_trades}  "
+                        f"{B}WR{X} {win_rate_str}  "
+                        f"{B}Up{X} {run_str}"
+                        + CLR
+                    ),
+                    f" {Y}{wib_time} WIB  ·  {et_time} ET{X}" + CLR,
+                    H + CLR,
+                    CLR,
+                ]
                 
                 sys.stdout.write("\n".join(table) + "\n")
                 sys.stdout.flush()
