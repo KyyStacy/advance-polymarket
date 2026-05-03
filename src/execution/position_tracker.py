@@ -16,6 +16,7 @@ class Position:
     closed: bool = False
     realized_pnl: float = 0.0
     exit_price: float | None = None
+    reconciled: bool = False  # True once on-chain balance confirms entry size/price
 
     def unrealized_pnl(self, mark_price: float) -> float:
         return (mark_price - self.entry_price) * self.size_shares

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..config.settings import Settings
@@ -27,6 +28,10 @@ _BALANCE_DELTA_EPSILON = 0.005
 # Kept here as a named constant so entry_engine / main.py can import it as
 # the single source of truth for the drift gate threshold.
 ENTRY_MAX_DRIFT = 0.04
+# Retry config for FAK kills — Polymarket sometimes briefly clears the book
+# at our implied price. A short pause + re-attempt usually fills.
+_BUY_MAX_ATTEMPTS = 3
+_BUY_RETRY_DELAY_SEC = 0.06  # 60 ms — long enough for book refill, short enough to stay in edge
 
 
 @dataclass
@@ -170,19 +175,23 @@ class OrderExecutor:
         fallback_cost: float,
     ) -> None:
         """Background task: wait for fill settlement, update position with actual values."""
-        size, cost, avg, reconciled = await self._reconcile_buy(
-            token_id, pre_token, pre_pusd, fallback_size, fallback_cost
-        )
-        pos = self.positions.open.get(token_id)
-        if pos is not None and reconciled:
-            pos.entry_price = avg
-            pos.size_shares = size
-            pos.cost_usd = cost
-        marker = "FILL" if reconciled else "FILL?"
-        log.info(
-            f"[exec] {marker} BUY reconciled: {size:.4f}sh @{avg:.4f} cost=${cost:.4f}"
-            f"{'' if reconciled else ' (ESTIMATE — reconciliation timeout)'}"
-        )
+        try:
+            size, cost, avg, reconciled = await self._reconcile_buy(
+                token_id, pre_token, pre_pusd, fallback_size, fallback_cost
+            )
+            pos = self.positions.open.get(token_id)
+            if pos is not None and reconciled:
+                pos.entry_price = avg
+                pos.size_shares = size
+                pos.cost_usd = cost
+                pos.reconciled = True
+            marker = "FILL" if reconciled else "FILL?"
+            log.info(
+                f"[exec] {marker} BUY reconciled: {size:.4f}sh @{avg:.4f} cost=${cost:.4f}"
+                f"{'' if reconciled else ' (ESTIMATE — settlement timed out)'}"
+            )
+        except Exception as e:
+            log.error(f"[exec] _bg_reconcile_buy error for {token_id[:8]}: {e}")
 
     async def _bg_reconcile_sell(
         self,
@@ -193,17 +202,25 @@ class OrderExecutor:
         fallback_avg: float,
     ) -> None:
         """Background task: confirm sell fill price for logging."""
-        avg, proceeds, reconciled = await self._reconcile_sell(
-            token_id, pre_token, pre_pusd, sold_shares, fallback_avg
-        )
-        marker = "CLOSE" if reconciled else "CLOSE?"
-        log.info(
-            f"[exec] {marker} SELL reconciled: {sold_shares:.4f}sh @{avg:.4f} "
-            f"proceeds=${proceeds:.4f}"
-            f"{'' if reconciled else ' (ESTIMATE — reconciliation timeout)'}"
-        )
+        try:
+            avg, proceeds, reconciled = await self._reconcile_sell(
+                token_id, pre_token, pre_pusd, sold_shares, fallback_avg
+            )
+            marker = "CLOSE" if reconciled else "CLOSE?"
+            log.info(
+                f"[exec] {marker} SELL reconciled: {sold_shares:.4f}sh @{avg:.4f} "
+                f"proceeds=${proceeds:.4f}"
+                f"{'' if reconciled else ' (ESTIMATE — settlement timed out)'}"
+            )
+        except Exception as e:
+            log.error(f"[exec] _bg_reconcile_sell error for {token_id[:8]}: {e}")
 
     # ------------------------------------------------------------ buy
+    @staticmethod
+    def _is_fak_kill(err: str) -> bool:
+        s = err.lower()
+        return "no orders found" in s or "fak order" in s
+
     async def buy_to_open(
         self,
         token_id: str,
@@ -211,8 +228,15 @@ class OrderExecutor:
         usd_amount: float,
         expected_ask: float,
         market_window_ts: int,
+        get_fresh_ask: Callable[[], float | None] | None = None,
     ) -> FillReport:
+        """Place a market buy. Auto-retries on FAK kill — book sometimes briefly
+        clears at the implied price; a short pause + retry usually fills.
+        `get_fresh_ask` is an optional callback (returns WebSocket-cached ask)
+        used to re-validate drift on retries; abort early if drift blows out.
+        """
         if self.in_cooldown():
+            log.info(f"[exec] buy skipped — executor in cooldown ({_ORDER_FAIL_COOLDOWN_SEC:.0f}s)")
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="cooldown")
 
         if self.s.dry_run:
@@ -233,29 +257,79 @@ class OrderExecutor:
             )
             return FillReport(True, expected_ask, shares, usd_amount, {"dry": True})
 
-        # Drift already validated in main.py against live WebSocket ask before this call.
-        # Only token balance snapshot needed here — pUSD baseline uses in-memory cache
-        # (refreshed every ~5s via _refresh_bankroll) to avoid a redundant HTTP call.
-        pre_token = await self.clob.get_token_balance(token_id) or 0.0
+        # Skip the pre-trade get_token_balance HTTP call: each market window
+        # has unique CTF token_ids and we never re-enter within a window, so
+        # pre_token is always 0. Reconciliation uses the absolute post-order
+        # balance directly. pUSD baseline comes from the in-memory cache.
+        pre_token = 0.0
         pre_pusd = self.clob._bankroll_cache
 
-        try:
-            resp = await self.clob.place_market_buy(token_id, usd_amount)
-        except Exception as e:
-            err_str = str(e)
-            transient = "no orders found" in err_str or "not enough balance" in err_str
-            if transient:
-                log.debug(f"[exec] buy_to_open transient failure: {e}")
-            else:
-                log.error(f"[exec] buy_to_open failed: {e}")
-                self._last_fail_ts = time.time()
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error=err_str)
+        log.info(
+            f"[exec] placing market buy {side_label} ${usd_amount:.2f} "
+            f"@≈{expected_ask:.3f} token={token_id[:8]}…"
+        )
 
-        ok = bool(resp.get("success", True)) and not resp.get("errorMsg")
-        if not ok:
-            log.warning(f"[exec] BUY rejected: {resp}")
+        resp: dict | None = None
+        last_err: str = ""
+        t0 = time.monotonic()
+        for attempt in range(1, _BUY_MAX_ATTEMPTS + 1):
+            # On retry: brief pause + drift re-check (instant via WebSocket cache).
+            if attempt > 1:
+                await asyncio.sleep(_BUY_RETRY_DELAY_SEC)
+                if get_fresh_ask is not None:
+                    fresh = get_fresh_ask()
+                    if fresh is None or fresh <= 0:
+                        log.info("[exec] retry abort — fresh ask unavailable")
+                        last_err = "ask-gone"
+                        break
+                    drift = fresh - expected_ask
+                    if drift > ENTRY_MAX_DRIFT:
+                        log.info(
+                            f"[exec] retry abort — drift ${drift:+.4f} exceeds "
+                            f"max ${ENTRY_MAX_DRIFT:.4f} (now {fresh:.3f})"
+                        )
+                        last_err = f"drift-on-retry({drift:+.4f})"
+                        break
+
+            try:
+                resp = await self.clob.place_market_buy(token_id, usd_amount)
+            except Exception as e:
+                last_err = str(e)
+                if self._is_fak_kill(last_err):
+                    log.info(
+                        f"[exec] buy attempt {attempt}/{_BUY_MAX_ATTEMPTS} "
+                        f"killed (FAK no match) — book may have moved"
+                    )
+                    resp = None
+                    continue
+                log.error(f"[exec] buy_to_open exception (non-retryable): {last_err}")
+                self._last_fail_ts = time.time()
+                return FillReport(False, 0.0, 0.0, 0.0, {}, error=last_err)
+
+            ok = bool(resp.get("success", True)) and not resp.get("errorMsg")
+            if ok:
+                break  # filled
+
+            err_msg = str(resp.get("errorMsg") or resp.get("error") or "")
+            last_err = err_msg
+            if self._is_fak_kill(err_msg):
+                log.info(
+                    f"[exec] buy attempt {attempt}/{_BUY_MAX_ATTEMPTS} "
+                    f"rejected (no match) — retrying"
+                )
+                resp = None
+                continue
+            log.warning(f"[exec] BUY rejected (non-retryable): {err_msg or resp}")
             self._last_fail_ts = time.time()
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="rejected")
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if resp is None:
+            log.warning(
+                f"[exec] BUY UNFILLED after {_BUY_MAX_ATTEMPTS} attempts "
+                f"in {elapsed_ms:.0f}ms — last={last_err[:120]}"
+            )
+            return FillReport(False, 0.0, 0.0, 0.0, {}, error=f"fak-killed:{last_err}")
 
         # Best-effort size estimate — updated with exact value by background reconciler.
         raw_taking = resp.get("takingAmount") or resp.get("size")
@@ -281,7 +355,7 @@ class OrderExecutor:
         )
         log.info(
             f"[exec] BUY SENT {side_label} ${usd_amount:.2f} @≈{expected_ask:.3f} "
-            f"~{est_size:.4f}sh token={token_id[:8]}… — reconciling"
+            f"~{est_size:.4f}sh in {elapsed_ms:.0f}ms — reconciling"
         )
         asyncio.ensure_future(
             self._bg_reconcile_buy(token_id, pre_token, pre_pusd, est_size, usd_amount)
@@ -305,21 +379,12 @@ class OrderExecutor:
                 True, mark_price, pos.size_shares, mark_price * pos.size_shares, {"dry": True}
             )
 
-        # Polymarket is source of truth for held shares; pUSD from cache.
-        actual_bal = await self.clob.get_token_balance(token_id)
-        if actual_bal is None:
-            log.warning("[exec] sell skipped — token balance query failed")
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="balance-query-failed")
-        if actual_bal <= 0:
-            log.debug("[exec] sell deferred — tokens not yet settled")
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="balance-pending")
-
-        if abs(actual_bal - pos.size_shares) > 0.01:
-            log.info(
-                f"[exec] sell size reconciled: local={pos.size_shares:.4f} → "
-                f"polymarket={actual_bal:.4f}"
-            )
-            pos.size_shares = actual_bal
+        # Sell immediately with local position size — no pre-sell validation.
+        # If reconciled: size is on-chain verified. If not: use order-response
+        # estimate. Don't block on settlement confirmation — momentum matters.
+        # If size is wrong, Polymarket rejects with "insufficient balance" →
+        # caught by exception handler, no cooldown triggered (transient error).
+        actual_bal = pos.size_shares
 
         pre_pusd = self.clob._bankroll_cache
 

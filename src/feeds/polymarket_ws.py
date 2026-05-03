@@ -31,11 +31,22 @@ class PolymarketBookFeed:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self.books: dict[str, dict] = {tid: {"bid": None, "ask": None} for tid in self.token_ids}
+        self._ws: object | None = None  # live WS connection, None when disconnected
 
-    def update_tokens(self, token_ids: Iterable[str]) -> None:
+    async def update_tokens(self, token_ids: Iterable[str]) -> None:
         self.token_ids = list(token_ids)
         for tid in self.token_ids:
             self.books.setdefault(tid, {"bid": None, "ask": None})
+        # Re-subscribe on the live connection so new tokens stream immediately.
+        # Without this, the server keeps sending old-token updates only and the
+        # new market window gets no bid/ask data until the next reconnect.
+        if self._ws is not None:
+            try:
+                sub = {"assets_ids": self.token_ids, "type": "market"}
+                await self._ws.send(orjson.dumps(sub).decode())  # type: ignore[union-attr]
+                log.info(f"[polymarket-ws] re-subscribed to {len(self.token_ids)} assets")
+            except Exception as e:
+                log.warning(f"[polymarket-ws] re-subscribe failed: {e}")
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="polymarket-ws")
@@ -59,6 +70,7 @@ class PolymarketBookFeed:
                 async with websockets.connect(
                     self.url, ping_interval=10, ping_timeout=10, max_queue=512
                 ) as ws:
+                    self._ws = ws
                     sub = {"assets_ids": self.token_ids, "type": "market"}
                     await ws.send(orjson.dumps(sub).decode())
                     log.info(
@@ -95,6 +107,8 @@ class PolymarketBookFeed:
                 log.warning(f"[polymarket-ws] disconnect: {e}; retry {backoff:.1f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+            finally:
+                self._ws = None
 
     def _handle(self, m: dict) -> None:
         et = m.get("event_type") or m.get("type")

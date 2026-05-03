@@ -21,10 +21,16 @@ class RiskManager:
     settings: Settings
     bankroll_usd: float = 0.0
     pnl: DailyPnl = field(default_factory=lambda: DailyPnl(day_key=""))
+    total_pnl: float = 0.0  # cumulative P&L across all days
 
     @staticmethod
     def _today_key() -> str:
-        return time.strftime("%Y-%m-%d", time.gmtime())
+        # Reset daily P&L at WIB (UTC+7) midnight, not UTC midnight
+        from datetime import datetime, timedelta, timezone
+        utc_now = datetime.now(timezone.utc)
+        wib_tz = timezone(timedelta(hours=7))
+        wib_now = utc_now.astimezone(wib_tz)
+        return wib_now.strftime("%Y-%m-%d")
 
     def _ensure_day(self) -> None:
         today = self._today_key()
@@ -38,6 +44,7 @@ class RiskManager:
         self._ensure_day()
         self.pnl.realized += pnl
         self.pnl.n_trades += 1
+        self.total_pnl += pnl
 
     def can_trade(self) -> tuple[bool, str]:
         self._ensure_day()
@@ -48,13 +55,15 @@ class RiskManager:
             )
         return True, "ok"
 
-    def position_size_usd(self, edge: float, implied_p: float) -> float:
-        """Choose USD size given edge and odds. Bounded by min/max bet config.
+    def position_size_usd(self, edge: float, implied_p: float, win_prob: float = 0.5) -> float:
+        """Choose USD size given edge, odds, and win probability.
 
         Sizing rule:
           - base = max_bet according to mode (pct of bankroll OR fixed USD)
-          - apply Kelly-fraction throttle: f = edge / (1 - implied_p)  (capped 25%)
-          - final = clamp(base * f_scaled, MIN_BET, base)
+          - bet ceiling scales with win_prob linearly from min_bet (50% confidence)
+            to base (100% confidence) — higher probability → larger ceiling
+          - Kelly fraction f = edge / (1 - implied_p) (capped 25%) applied within ceiling
+          - final = clamp(ceil * f_scaled, MIN_BET, ceil)
         """
         s = self.settings
         if s.max_bet_mode == "pct":
@@ -69,8 +78,17 @@ class RiskManager:
         else:
             f = max(0.0, edge / max(1e-6, 1.0 - implied_p))
             f = min(f, 0.25)  # never bet more than 25% Kelly
-        size = base * (f / 0.25) if base > 0 else 0.0  # scale to base when full Kelly
-        size = max(min(size, base), 0.0)
-        if size > 0 and size < s.min_bet_usd:
-            size = s.min_bet_usd if base >= s.min_bet_usd else 0.0
+
+        # Probability-scaled ceiling: win_prob [0.5, 1.0] → ceiling [min_bet, base].
+        # At 50% (coin flip) ceiling = min_bet; at 100% (certain) ceiling = base.
+        prob_scale = max(0.0, min(1.0, (win_prob - 0.5) * 2.0))
+        ceil_usd = s.min_bet_usd + prob_scale * max(0.0, base - s.min_bet_usd)
+        ceil_usd = max(s.min_bet_usd, min(ceil_usd, base))
+
+        # Kelly fraction scales within the probability-determined ceiling
+        size = ceil_usd * (f / 0.25) if f > 0 else 0.0
+        size = max(0.0, min(size, ceil_usd))
+
+        if 0 < size < s.min_bet_usd:
+            size = s.min_bet_usd if ceil_usd >= s.min_bet_usd else 0.0
         return round(size, 2)

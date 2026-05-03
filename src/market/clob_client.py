@@ -219,19 +219,30 @@ class PolymarketClobClient:
     async def place_market_buy(
         self, token_id: str, usd_amount: float, order_type: str = OrderType.FAK
     ) -> dict:
-        """Unbounded market buy — fills against any ask. Avoid in production:
-        with thin liquidity this can walk the book up arbitrarily. Prefer
-        `place_capped_buy` which caps the worst fill price."""
+        """Unbounded market buy — fills against any ask. The SDK uses
+        user_usdc_balance to compute the implied price; we pass at least the
+        order size so the SDK never under-quotes the cap and triggers a
+        spurious FAK kill."""
         await self.ensure_ready()
+        # Defensive floor: never pass a balance lower than the trade size, or
+        # the SDK may compute a too-tight implied price that the matching
+        # engine refuses to match.
+        user_balance = max(self._bankroll_cache, usd_amount * 1.05)
         args = MarketOrderArgsV2(
             token_id=token_id,
             amount=usd_amount,
             side=BUY,
             order_type=order_type,
-            user_usdc_balance=self._bankroll_cache,
+            user_usdc_balance=user_balance,
         )
-        signed = self.client.create_market_order(args)  # CPU-only signing, no I/O
-        resp = await asyncio.to_thread(self.client.post_order, signed, order_type)
+        # Combine signing + post into a single thread call. EIP712 signing is
+        # CPU-bound (~5-15ms) and would otherwise block the event loop, freezing
+        # WebSocket book updates while we sign — a single thread keeps WS feeds
+        # live and eliminates the await-overhead between sign and post.
+        def _sign_and_post() -> Any:
+            signed = self.client.create_market_order(args)
+            return self.client.post_order(signed, order_type)
+        resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
 
     async def place_capped_buy(
@@ -253,8 +264,10 @@ class PolymarketClobClient:
         args = OrderArgsV2(
             token_id=token_id, price=round(max_price, 3), size=size_shares, side=BUY
         )
-        signed = await asyncio.to_thread(self.client.create_order, args)
-        resp = await asyncio.to_thread(self.client.post_order, signed, order_type)
+        def _sign_and_post() -> Any:
+            signed = self.client.create_order(args)
+            return self.client.post_order(signed, order_type)
+        resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
 
     async def place_limit(
@@ -267,8 +280,10 @@ class PolymarketClobClient:
     ) -> dict:
         await self.ensure_ready()
         args = OrderArgsV2(token_id=token_id, price=price, size=size_shares, side=side)
-        signed = await asyncio.to_thread(self.client.create_order, args)
-        resp = await asyncio.to_thread(self.client.post_order, signed, order_type)
+        def _sign_and_post() -> Any:
+            signed = self.client.create_order(args)
+            return self.client.post_order(signed, order_type)
+        resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
 
     async def place_market_sell(
@@ -287,6 +302,10 @@ class PolymarketClobClient:
             side=SELL,
             user_usdc_balance=self._bankroll_cache,
         )
-        signed = self.client.create_market_order(args)  # CPU-only signing, no I/O
-        resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
+        # Combine signing + post into a single thread call (see place_market_buy
+        # for rationale — keeps event loop free for WS updates during signing).
+        def _sign_and_post() -> Any:
+            signed = self.client.create_market_order(args)
+            return self.client.post_order(signed, OrderType.FAK)
+        resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}

@@ -37,6 +37,8 @@ class TradingBot:
         setup_logger(self.s.log_level, self.s.log_file, console=False)
         self.log = get_logger()
 
+        self._dry_run_initial_bankroll = 100.0  # initial capital for dry run simulation
+
         self.agg = PriceAggregator()
 
         self.binance = BinanceFeed(self.agg.on_cex)
@@ -130,7 +132,7 @@ class TradingBot:
             self._current_market = None
             return
         self._current_market = market
-        self.poly_book.update_tokens(market.tokens)
+        await self.poly_book.update_tokens(market.tokens)
         self.log.info(
             f"[bot] tracking market {market.slug} cond={market.condition_id[:10]}…"
         )
@@ -150,8 +152,11 @@ class TradingBot:
     # ------------------------------------------------------------------ bankroll
     async def _refresh_bankroll(self) -> None:
         if self.s.dry_run:
-            if self.risk.bankroll_usd == 0.0:
-                self.risk.update_bankroll(100.0)
+            # Dry run: simulate realistic bankroll by tracking P&L growth/drawdown.
+            # Starting capital + cumulative realized P&L = current simulated balance.
+            # This makes bet sizing scale realistically as portfolio grows or shrinks.
+            simulated_bal = max(1.0, self._dry_run_initial_bankroll + self.risk.total_pnl)
+            self.risk.update_bankroll(simulated_bal)
             return
         bal = await self.clob.get_usdc_balance()
         if bal is not None and bal > 0:
@@ -275,9 +280,12 @@ class TradingBot:
                     f"[bot] EXIT {existing.side} mark={mark:.3f} "
                     f"unreal={unreal_pct:+.1%} held={seconds_held:.0f}s reason={ed.reason}"
                 )
-                await self.executor.sell_to_close(existing.token_id, mark)
-                if self.positions.closed:
-                    self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+                sell = await self.executor.sell_to_close(existing.token_id, mark)
+                if sell.success:
+                    if self.positions.closed:
+                        self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+                else:
+                    self.log.warning(f"[bot] SELL FAILED {existing.side} — {sell.error}")
             return
 
         # ---- no position: check entry ----
@@ -324,7 +332,8 @@ class TradingBot:
         if not decision.enter:
             return
 
-        size_usd = self.risk.position_size_usd(decision.edge, decision.implied_ask or 0.5)
+        win_prob = misp.fair_p_up if decision.side == "UP" else (1.0 - misp.fair_p_up)
+        size_usd = self.risk.position_size_usd(decision.edge, decision.implied_ask or 0.5, win_prob)
         if size_usd < self.s.min_bet_usd:
             self.log.debug(
                 f"[bot] size_usd={size_usd:.2f} < min_bet={self.s.min_bet_usd} — skip"
@@ -355,15 +364,19 @@ class TradingBot:
         self.log.info(
             f"[bot] ENTRY {decision.side} ${size_usd:.2f} "
             f"ask={execution_ask:.3f} edge={decision.edge:.3f} "
-            f"z={mom.z_score:.2f}{ll_str}{fee_str}"
+            f"wp={win_prob:.2f} z={mom.z_score:.2f}{ll_str}{fee_str}"
         )
-        await self.executor.buy_to_open(
-            token_id=decision.token_id or "",
+        target_token = decision.token_id or ""
+        fill = await self.executor.buy_to_open(
+            token_id=target_token,
             side_label=decision.side or "?",
             usd_amount=size_usd,
             expected_ask=execution_ask,
             market_window_ts=m.window_ts,
+            get_fresh_ask=lambda: self._ask_for(target_token),
         )
+        if not fill.success:
+            self.log.warning(f"[bot] BUY FAILED {decision.side} — {fill.error}")
 
     # ------------------------------------------------------------------ loop
     async def _strategy_loop(self) -> None:
@@ -484,6 +497,7 @@ class TradingBot:
                     else f"{Y}WAITING...{X}"
                 )
 
+                diff = 0.0  # initialize for display section
                 if self.oracle.current_candle_open > 0:
                     price_to_beat_str = f"${self.oracle.current_candle_open:,.2f}"
                     diff = self.oracle.latest_price - self.oracle.current_candle_open
@@ -496,8 +510,10 @@ class TradingBot:
                     diff_str = f"{Y}WAITING...{X}"
                     status_str = f"{Y}{B}WAITING NEXT CANDLE{X}"
 
-                pnl_val = self.risk.pnl.realized
-                pnl_str = f"{G if pnl_val >= 0 else R}{pnl_val:+.2f}{X}"
+                daily_pnl = self.risk.pnl.realized
+                total_pnl = self.risk.total_pnl
+                daily_str = f"{G if daily_pnl >= 0 else R}{daily_pnl:+.2f}{X}"
+                total_str = f"{G if total_pnl >= 0 else R}{total_pnl:+.2f}{X}"
                 interval_min = int(self.oracle.interval_ms / 60000)
                 next_candle_val = f"{int(remain//60):02d}:{int(remain%60):02d} | {self.oracle.status}"
 
@@ -507,11 +523,8 @@ class TradingBot:
                 run_str = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
 
                 total_trades = len(self.positions.closed)
-                if total_trades > 0:
-                    wins = sum(1 for p in self.positions.closed if p.realized_pnl > 0)
-                    win_rate_str = f"{wins/total_trades*100:.1f}%"
-                else:
-                    win_rate_str = "0.0%"
+                wins = sum(1 for p in self.positions.closed if p.realized_pnl > 0) if total_trades > 0 else 0
+                win_rate_str = f"{wins/total_trades*100:.1f}%" if total_trades > 0 else "0.0%"
 
                 from datetime import timezone
                 wib_now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=7)))
@@ -528,55 +541,102 @@ class TradingBot:
                 def vlen(s: str) -> int:
                     return len(_ansi_strip.sub('', s))
 
-                def row2(left: str, right: str, lw: int = 32) -> str:
-                    pad = ' ' * max(0, lw - vlen(left))
-                    return f" {left}{pad}{right}" + CLR
+                def pad_center(s: str, width: int) -> str:
+                    stripped = _ansi_strip.sub('', s)
+                    if len(stripped) >= width:
+                        return s
+                    left_pad = (width - len(stripped)) // 2
+                    right_pad = width - len(stripped) - left_pad
+                    return ' ' * left_pad + s + ' ' * right_pad
 
-                W = 64
+                def bar(fill: float, width: int = 20, char: str = '█') -> str:
+                    """Progress bar: fill is 0..1"""
+                    f = max(0, min(1, fill))
+                    filled = int(f * width)
+                    empty = width - filled
+                    col = G if f >= 0.5 else (Y if f >= 0.25 else R)
+                    return f"{col}{char * filled}{X}{char * empty}"
+
+                W = 68
                 CLR = "\033[K"
-                H = f"{C}{'━' * W}{X}"
-                D = f"{C}{'─' * W}{X}"
+                H = f"{C}{'═' * W}{X}"
+                T = f"{C}{'─' * W}{X}"
 
                 countdown = f"{int(remain//60):02d}:{int(remain%60):02d}"
 
+                # Win rate visual (before market direction)
+                wr_val = (wins / total_trades) if total_trades > 0 else 0
+                wr_bar = bar(wr_val, 15)
+
+                # Market direction indicator
+                if diff != 0:
+                    momentum_icon = "📈" if diff > 0 else "📉"
+                else:
+                    momentum_icon = "◼"
+
                 table = [
                     H + CLR,
-                    f" {B}POLYMARKET BTC-{interval_min}M{X}  ·  {Y}{time_range}{X}" + CLR,
-                    D + CLR,
-                    row2(f"{C}Binance {X} {binance_str}",  f"{C}Price {X}{B}{chainlink_str}{X}"),
-                    row2(f"{C}Coinbase{X} {coinbase_str}", f"{C}Open  {X}{B}{price_to_beat_str}{X}"),
-                    row2("",                               f"{C}Diff  {X}{diff_str}  {status_str}"),
-                    D + CLR,
-                    f" {B}Next Candle{X}  {Y}{countdown}{X}  ·  {Y}{self.oracle.status}{X}" + CLR,
+                    f" {B}⚡ POLYMARKET BTC-{interval_min}M TRADING BOT{X}" + CLR,
+                    f" {Y}┃{X} {time_range}" + CLR,
+                    T + CLR,
                 ]
 
+                # Price section with grid layout
+                table += [
+                    f" {B}📊 PRICE FEEDS{X}" + CLR,
+                    f" ┃ CEX Mid    {C}Binance:{X} {binance_str:<20}  {C}Coinbase:{X} {coinbase_str}" + CLR,
+                    f" ┃ Chainlink  {C}Price:{X}   {B}{chainlink_str:<20}{X}  {C}Open:{X}  {B}{price_to_beat_str}{X}" + CLR,
+                    f" ┃ Diff       {diff_str:<20}  {status_str:<15} {momentum_icon}" + CLR,
+                    T + CLR,
+                ]
+
+                # Market countdown
+                candle_color = Y if remain < 60 else C
+                table += [
+                    f" {B}⏱ NEXT CANDLE{X}  {candle_color}{countdown}{X}  ({self.oracle.status})" + CLR,
+                    T + CLR,
+                ]
+
+                # Open position section
                 if self.positions.open:
-                    table.append(D + CLR)
+                    table.append(f" {B}📍 ACTIVE POSITION{X}" + CLR)
                     for pos in self.positions.open.values():
                         mark = self._bid_for(pos.token_id) or pos.entry_price
                         unreal = (mark - pos.entry_price) * pos.size_shares
+                        unreal_pct = (unreal / (pos.cost_usd or 0.01)) * 100 if pos.cost_usd else 0
                         ucol = G if unreal >= 0 else R
-                        left = (
-                            f" {G}▶ {pos.side}{X}"
-                            f"  {pos.size_shares:.2f} sh"
-                            f"  entry ${pos.entry_price:.3f}"
-                            f"  unreal {ucol}{unreal:+.4f}{X}"
+
+                        side_icon = "▲" if pos.side == "UP" else "▼"
+                        side_col = G if pos.side == "UP" else R
+
+                        table.append(
+                            f" ┃ {side_col}{side_icon} {pos.side}{X}  "
+                            f"Size: {pos.size_shares:.3f}sh  "
+                            f"Entry: ${pos.entry_price:.3f}  "
+                            f"Mark: ${mark:.3f}" + CLR
                         )
-                        tag = f"{Y}{B}[OPEN]{X}"
-                        pad = ' ' * max(1, W - vlen(left) - vlen(tag))
-                        table.append(f"{left}{pad}{tag}" + CLR)
+                        table.append(
+                            f" ┃ Unrealized: {ucol}{unreal:+.4f} ({unreal_pct:+.1f}%){X}  "
+                            f"Held: {int((time.time() - pos.opened_at))}s" + CLR
+                        )
+                    table.append(T + CLR)
+                else:
+                    # Show ready-to-trade status
+                    table.append(f" {Y}⏸ WAITING FOR SIGNAL{X}" + CLR)
+                    table.append(T + CLR)
+
+                # Performance section
+                total_profit_color = G if total_pnl >= 0 else R
+                daily_profit_color = G if daily_pnl >= 0 else R
 
                 table += [
+                    f" {B}📈 PERFORMANCE{X}" + CLR,
+                    f" ┃ Bankroll    ${bal:.2f}" + CLR,
+                    f" ┃ Daily P&L   {daily_profit_color}{daily_pnl:+.2f}{X}  ┃  Total P&L  {total_profit_color}{total_pnl:+.2f}{X}" + CLR,
+                    f" ┃ Trades      {total_trades:<6}  ┃  Win Rate   {wr_bar}  {wr_val*100:.1f}%" + CLR,
+                    f" ┃ Uptime      {run_str}" + CLR,
                     H + CLR,
-                    (
-                        f" {B}Bal{X} {bal_str}  "
-                        f"{B}P&L{X} {pnl_str}  "
-                        f"{B}Trades{X} {total_trades}  "
-                        f"{B}WR{X} {win_rate_str}  "
-                        f"{B}Up{X} {run_str}"
-                        + CLR
-                    ),
-                    f" {Y}{wib_time} WIB  ·  {et_time} ET{X}" + CLR,
+                    f" {Y}{wib_time} WIB{X}  ┃  {Y}{et_time} ET{X}" + CLR,
                     H + CLR,
                     CLR,
                 ]

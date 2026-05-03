@@ -53,7 +53,7 @@ class ExitEngine:
 
     def __init__(self, settings: Settings):
         self.s = settings
-        self._last_mispricing_ts: float = 0.0
+        self._last_mispricing_ts: float = time.time()  # init to now so first ticks get a grace period
 
     def decide(
         self,
