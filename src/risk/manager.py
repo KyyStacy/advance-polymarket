@@ -21,7 +21,12 @@ class RiskManager:
     settings: Settings
     bankroll_usd: float = 0.0
     pnl: DailyPnl = field(default_factory=lambda: DailyPnl(day_key=""))
-    total_pnl: float = 0.0  # cumulative P&L across all days
+    total_pnl: float = 0.0  # cumulative trade-based P&L (kept for dry-run sizing)
+
+    # Balance-based baselines for display P&L
+    _start_balance: float = 0.0          # balance when bot first started
+    _daily_start_balance: float = 0.0     # balance at WIB midnight (or first read)
+    _last_day_key: str = ""              # for midnight detection
 
     @staticmethod
     def _today_key() -> str:
@@ -35,6 +40,40 @@ class RiskManager:
     def _ensure_day(self) -> None:
         today = self._today_key()
         if self.pnl.day_key != today:
+            self.pnl = DailyPnl(day_key=today)
+
+    @property
+    def balance_total_pnl(self) -> float:
+        """Total P&L since bot start, measured from balance change."""
+        if self._start_balance <= 0:
+            return 0.0
+        return self.bankroll_usd - self._start_balance
+
+    @property
+    def balance_daily_pnl(self) -> float:
+        """Daily P&L since last WIB midnight, measured from balance change."""
+        if self._daily_start_balance <= 0:
+            return 0.0
+        return self.bankroll_usd - self._daily_start_balance
+
+    def init_start_balance(self, usd: float) -> None:
+        """Set starting balance (once, at bot startup)."""
+        if self._start_balance <= 0:
+            self._start_balance = max(0.0, float(usd))
+            log.info(f"[risk] start balance locked: ${self._start_balance:.2f}")
+
+    def reset_daily_balance(self, usd: float) -> None:
+        """Reset daily baseline (called at WIB midnight or on first balance read)."""
+        self._daily_start_balance = max(0.0, float(usd))
+        log.info(f"[risk] daily balance reset: ${self._daily_start_balance:.2f}")
+
+    def maybe_reset_daily(self, usd: float) -> None:
+        """Auto-detect WIB day change and reset daily baseline."""
+        today = self._today_key()
+        if today != self._last_day_key:
+            self._last_day_key = today
+            self.reset_daily_balance(usd)
+            # Also clear trade-based daily tracker so it stays consistent
             self.pnl = DailyPnl(day_key=today)
 
     def update_bankroll(self, usd: float) -> None:

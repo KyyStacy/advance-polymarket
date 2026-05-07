@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 from typing import Any
 
 # Suppress noisy per-request error output from the py_clob_client_v2 library.
@@ -44,6 +45,7 @@ from py_clob_client_v2.clob_types import (
     OpenOrderParams,
     OrderArgsV2,
     OrderType,
+    PartialCreateOrderOptions,
 )
 from py_clob_client_v2.order_builder.constants import BUY, SELL
 
@@ -217,30 +219,39 @@ class PolymarketClobClient:
 
     # ------------------------------------------------------------------ order placement
     async def place_market_buy(
-        self, token_id: str, usd_amount: float, order_type: str = OrderType.FAK
+        self,
+        token_id: str,
+        usd_amount: float,
+        worst_price: float,
+        order_type: str = OrderType.FAK,
+        *,
+        cancel_flag: threading.Event | None = None,
     ) -> dict:
-        """Unbounded market buy — fills against any ask. The SDK uses
-        user_usdc_balance to compute the implied price; we pass at least the
-        order size so the SDK never under-quotes the cap and triggers a
-        spurious FAK kill."""
+        """FAK market buy with worst-price slippage protection.
+
+        `worst_price`: exchange enforces this as the maximum fill price.
+        Any liquidity at <= worst_price fills; the remainder is killed (FAK).
+        `cancel_flag`: if set before the POST fires, the thread aborts without
+        sending the order (used by the timeout path in buy_to_open).
+        """
         await self.ensure_ready()
-        # Defensive floor: never pass a balance lower than the trade size, or
-        # the SDK may compute a too-tight implied price that the matching
-        # engine refuses to match.
         user_balance = max(self._bankroll_cache, usd_amount * 1.05)
         args = MarketOrderArgsV2(
             token_id=token_id,
             amount=usd_amount,
             side=BUY,
-            order_type=order_type,
+            price=worst_price,
             user_usdc_balance=user_balance,
         )
+        options = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
         # Combine signing + post into a single thread call. EIP712 signing is
         # CPU-bound (~5-15ms) and would otherwise block the event loop, freezing
         # WebSocket book updates while we sign — a single thread keeps WS feeds
         # live and eliminates the await-overhead between sign and post.
         def _sign_and_post() -> Any:
-            signed = self.client.create_market_order(args)
+            signed = self.client.create_market_order(order_args=args, options=options)
+            if cancel_flag is not None and cancel_flag.is_set():
+                raise RuntimeError("buy cancelled before POST (timeout)")
             return self.client.post_order(signed, order_type)
         resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
@@ -296,11 +307,16 @@ class PolymarketClobClient:
         No minimum share requirement unlike limit FAK orders.
         """
         await self.ensure_ready()
+        # SDK computes implied_price = user_usdc_balance / size_shares for SELL orders.
+        # Guard against near-zero bankroll_cache (stale/not-yet-refreshed) which would
+        # produce implied_price < 0.01 (Polymarket minimum) and get rejected.
+        # Floor: at least 1¢ per share → always above the 0.01 minimum.
+        user_balance = max(self._bankroll_cache, round(size_shares, 4) * 0.02)
         args = MarketOrderArgsV2(
             token_id=token_id,
             amount=round(size_shares, 4),
             side=SELL,
-            user_usdc_balance=self._bankroll_cache,
+            user_usdc_balance=user_balance,
         )
         # Combine signing + post into a single thread call (see place_market_buy
         # for rationale — keeps event loop free for WS updates during signing).

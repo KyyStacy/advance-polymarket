@@ -111,6 +111,32 @@ class EntryEngine:
                 return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
                                      f"below-min-odds edge={mispricing.edge:.3f}<{self.s.ev_override_min_edge:.2f}")
 
+        # Extreme-price filters — two tiers based on how close to resolution:
+        #
+        # Tier 1 (ask < 0.10): market is ~90%+ sure we lose. Near resolution,
+        # books are very thin and the outcome is nearly binary. Live data shows:
+        #   - Wins at ask<0.10 ALL had ll >= 2.5bps
+        #   - Losses at ask<0.10 ALL had ll = 2.1-2.2bps (barely above 2.0 floor)
+        # Require ll >= 2.5bps as an additional confirmation that lead-lag
+        # genuinely supports the trade, not just hitting the minimum threshold.
+        if implied_ask < 0.10 and leadlag is not None:
+            ll_signed = leadlag.deviation_bps if side == "UP" else -leadlag.deviation_bps
+            if ll_signed < 2.5:
+                return EntryDecision(
+                    False, side, token_id, implied_ask, mispricing.edge,
+                    f"extreme-price-ll-weak ask={implied_ask:.3f}<0.10 ll={ll_signed:.1f}bps<2.5"
+                )
+        #
+        # Tier 2 (ask < 0.15): market prices us as 85%+ loser.
+        #   1. Book is thin → market order fills 15-25% above signal ask
+        #   2. Momentum half-life ~2s; Gnosis Safe fills take 0.5-3s → stale by fill
+        # Require z >= 2.5 (vs normal 2.0) for real directional conviction.
+        if implied_ask < 0.15 and momentum.z_score < 2.5:
+            return EntryDecision(
+                False, side, token_id, implied_ask, mispricing.edge,
+                f"extreme-price-z-weak ask={implied_ask:.3f}<0.15 z={momentum.z_score:.2f}<2.5"
+            )
+
         # Edge gate
         if mispricing.edge < self.s.min_edge:
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,

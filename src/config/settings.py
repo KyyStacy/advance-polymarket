@@ -55,11 +55,10 @@ class Settings:
     clob_host: str
     gamma_host: str
     polymarket_ws: str
-    polygon_rpc: str  # used by redeemer for on-chain CTF claim
+    polygon_rpc: str  # Polygon RPC for on-chain operations
 
     # Mode
     dry_run: bool
-    auto_claim: bool
 
     # Risk / sizing
     min_bet_usd: float
@@ -119,7 +118,6 @@ def load_settings(env_path: str | None = None) -> Settings:
             "https://polygon-bor-rpc.publicnode.com,https://polygon.llamarpc.com",
         ),
         dry_run=_envb("DRY_RUN", True),
-        auto_claim=_envb("AUTO_CLAIM", True),
         min_bet_usd=_envf("MIN_BET_USD", 2.0),
         max_bet_mode=mode,  # type: ignore[arg-type]
         max_bet_pct=_envf("MAX_BET_PCT", 5.0),

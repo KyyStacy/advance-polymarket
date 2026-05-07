@@ -13,7 +13,6 @@ from .feeds.polymarket_ws import PolymarketBookFeed
 from .feeds.price_aggregator import PriceAggregator
 from .market.clob_client import PolymarketClobClient
 from .market.discovery import MarketDiscovery, MarketInfo
-from .market.redeemer import PositionRedeemer
 from .risk.manager import RiskManager
 from .signals.lead_lag import LeadLagDetector
 from .signals.mispricing import MispricingEvaluator
@@ -55,7 +54,6 @@ class TradingBot:
 
         self.discovery = MarketDiscovery(self.s.gamma_host)
         self.clob = PolymarketClobClient(self.s)
-        self.redeemer = PositionRedeemer(self.s.polygon_rpc, self.s.private_key)
 
         self.momentum = MomentumAnalyzer(self.agg)
         self.leadlag = LeadLagDetector(self.agg)
@@ -79,17 +77,50 @@ class TradingBot:
         # Polymarket taker fee — fixed at 2% (matches their published rate for prediction markets)
         self._taker_fee_rate: float = 0.02
 
-        # Track positions held through window end (pending redemption)
-        self._pending_redeem: list[tuple[str, str, str]] = []  # (condition_id, side, token_id)
         # Dedup key for signal logging — only log when signal state changes
         self._last_signal_key: str = ""
+        self._last_abort_key: str = ""
+        self._last_sell_fail_ts: float = 0.0
+        self._last_sell_fail_reason: str = ""
+        # Dedup key for buy failures — prevents log spam when the same error
+        # repeats every 50ms tick (e.g. post-sell-cooldown for 5s = 100 lines).
+        self._last_buy_fail_reason: str = ""
         self._start_time: float = time.time()
+        # Stop new entries after N consecutive losing trades in the same window.
+        # Prevents overtrading when the market is clearly trending against our
+        # signals — e.g., 4 consecutive UP losses while market resolves DOWN.
+        self._consecutive_losses: int = 0
+        self._window_trading_stopped: bool = False
+        # Rapid flip cooldown: after a side-flip exit with hold_time < 15s,
+        # block new entries for 30s. A flip within 15s means the market was
+        # in a highly uncertain/flip-flopping state — re-entering immediately
+        # lands us in the same instability and almost always loses again.
+        self._last_rapid_flip_ts: float = 0.0
+        _RAPID_FLIP_HOLD_SEC = 15.0   # exit within this → considered a rapid flip
+        _RAPID_FLIP_COOLDOWN_SEC = 30.0  # how long to block re-entry after rapid flip
+        self._rapid_flip_hold_sec: float = _RAPID_FLIP_HOLD_SEC
+        self._rapid_flip_cooldown_sec: float = _RAPID_FLIP_COOLDOWN_SEC
+        # High-water mark for current open position — used for trailing stop logic.
+        # Tracks peak unrealized_pct since entry; resets when position closes.
+        self._peak_unreal: float = 0.0
 
     # ------------------------------------------------------------------ feeds
     def _on_poly_book(
         self, token_id: str, ts: float, bid: float | None, ask: float | None
     ) -> None:
-        self._poly_books[token_id] = {"bid": bid, "ask": ask, "ts": ts}
+        old = self._poly_books.get(token_id, {})
+        # Preserve last known ask when ask becomes None — happens during the brief
+        # gap between a price_change removal of the top ask and the WS sending the
+        # next price level. Without this, _ask_for returns None and every strategy
+        # tick during that gap aborts entry with "ask-gone" even though the book is
+        # still liquid (just at a slightly higher price).
+        last_ask = old.get("ask") if old.get("ask") is not None else old.get("last_ask")
+        last_bid = old.get("bid") if old.get("bid") is not None else old.get("last_bid")
+        self._poly_books[token_id] = {
+            "bid": bid, "ask": ask,
+            "last_ask": last_ask, "last_bid": last_bid,
+            "ts": ts,
+        }
 
     # ------------------------------------------------------------------ anchor / window
     def _try_lock_anchor(self) -> bool:
@@ -132,7 +163,9 @@ class TradingBot:
             self._current_market = None
             return
         self._current_market = market
-        await self.poly_book.update_tokens(market.tokens)
+        # Fresh restart WS + clear stale books — same pattern as best_ask.py
+        self._poly_books.clear()
+        await self.poly_book.restart(market.tokens)
         self.log.info(
             f"[bot] tracking market {market.slug} cond={market.condition_id[:10]}…"
         )
@@ -143,11 +176,17 @@ class TradingBot:
     # ------------------------------------------------------------------ data helpers
     def _ask_for(self, token_id: str) -> float | None:
         b = self._poly_books.get(token_id)
-        return b["ask"] if b else None
+        if not b:
+            return None
+        # Return current best ask; fall back to last_ask during the brief WS gap
+        # after a price_change removal clears the top level before the next arrives.
+        return b["ask"] or b.get("last_ask")
 
     def _bid_for(self, token_id: str) -> float | None:
         b = self._poly_books.get(token_id)
-        return b["bid"] if b else None
+        if not b:
+            return None
+        return b["bid"] or b.get("last_bid")
 
     # ------------------------------------------------------------------ bankroll
     async def _refresh_bankroll(self) -> None:
@@ -157,11 +196,18 @@ class TradingBot:
             # This makes bet sizing scale realistically as portfolio grows or shrinks.
             simulated_bal = max(1.0, self._dry_run_initial_bankroll + self.risk.total_pnl)
             self.risk.update_bankroll(simulated_bal)
+            # Initialise balance baselines once so display P&L works in dry-run too
+            self.risk.init_start_balance(self._dry_run_initial_bankroll)
+            self.risk.maybe_reset_daily(simulated_bal)
             return
         bal = await self.clob.get_usdc_balance()
         if bal is not None and bal > 0:
             old = self.risk.bankroll_usd
             self.risk.update_bankroll(bal)
+            # Lock start balance on first successful read
+            self.risk.init_start_balance(bal)
+            # Auto-reset daily baseline at WIB midnight
+            self.risk.maybe_reset_daily(bal)
             if abs(bal - old) > 0.01:
                 self.log.info(f"[bot] bankroll updated: ${bal:.2f}")
         elif self.risk.bankroll_usd == 0.0:
@@ -175,24 +221,13 @@ class TradingBot:
             else:
                 self.risk.update_bankroll(self.s.max_bet_usd * 4)  # minimal sentinel
 
-    # ------------------------------------------------------------------ auto-claim
-    async def _process_pending_redeems(self) -> None:
-        if not self.s.auto_claim or self.s.dry_run or not self._pending_redeem:
-            return
-        still_pending: list[tuple[str, str, str]] = []
-        for cond_id, side, token_id in self._pending_redeem:
-            ok = await self.redeemer.redeem(cond_id, side)
-            if not ok:
-                still_pending.append((cond_id, side, token_id))
-        self._pending_redeem = still_pending
-
     # ------------------------------------------------------------------ window close
     async def _resolve_window(self, market: MarketInfo) -> None:
         """Handle end-of-window for positions that survived through resolution.
 
         Signal-based exits should have already closed the position. If one remains
         it means the exit signal never fired — the position will be settled on-chain
-        by Polymarket. If AUTO_CLAIM=true, queue it for redemption.
+        by Polymarket. Redemption is handled via Polymarket account settings.
         """
         leftover = self.positions.get_for_window(market.window_ts)
         if leftover is None:
@@ -205,20 +240,24 @@ class TradingBot:
                 f"[bot] PRE-RESOLUTION SELL {leftover.side} {leftover.size_shares:.2f}sh "
                 f"@bid={mark:.3f} window={market.window_ts}"
             )
-            await self.executor.sell_to_close(leftover.token_id, mark)
-            if self.positions.closed:
-                self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+            sell = await self.executor.sell_to_close(leftover.token_id, mark)
+            if sell.success:
+                if self.positions.closed:
+                    self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+            else:
+                # Sell failed (thin book at resolution) — position goes to on-chain resolution.
+                # Polymarket handles redemption automatically via account settings.
+                self.log.warning(
+                    f"[bot] PRE-RESOLUTION SELL failed ({sell.error}) "
+                    f"— position settles on-chain via Polymarket"
+                )
+                self.positions.open.pop(leftover.token_id, None)
         else:
             # No liquid exit — position goes to on-chain resolution
-            # Mark as pending redemption; update PnL after claim
             self.log.info(
                 f"[bot] HOLDING TO RESOLUTION {leftover.side} "
-                f"cond={market.condition_id[:10]}… — queued for auto-claim"
+                f"cond={market.condition_id[:10]}… — Polymarket will settle"
             )
-            if self.s.auto_claim and market.condition_id:
-                self._pending_redeem.append(
-                    (market.condition_id, leftover.side, leftover.token_id)
-                )
             self.positions.open.pop(leftover.token_id, None)
 
     # ------------------------------------------------------------------ main tick
@@ -246,7 +285,6 @@ class TradingBot:
         self._tick_count += 1
         if self._tick_count % _BANKROLL_REFRESH_TICKS == 1:
             await self._refresh_bankroll()
-            await self._process_pending_redeems()
 
         mom = self.momentum.read(now)
         ll = self.leadlag.read(now)
@@ -271,21 +309,58 @@ class TradingBot:
         if existing is not None:
             mark = (up_bid if existing.side == "UP" else down_bid) or existing.entry_price
             unreal_pct = (mark - existing.entry_price) / max(existing.entry_price, 1e-3)
+            self._peak_unreal = max(self._peak_unreal, unreal_pct)
             seconds_held = now - existing.opened_at
             ed = self.exit_engine.decide(
-                existing.side, sec_left, mom, ll, misp, unreal_pct, seconds_held
+                existing.side, sec_left, mom, ll, misp, unreal_pct, seconds_held,
+                peak_unreal=self._peak_unreal,
             )
             if ed.exit:
+                # Throttle: if sell just failed, wait 1s before retrying to avoid
+                # 50ms-tick spam. 6 internal retries × ~300ms each ≈ 1.8s per call;
+                # external throttle caps retry rate to ~1/s when internal loop exhausts.
+                now_ts = time.time()
+                sell_cooldown_ok = (now_ts - self._last_sell_fail_ts) >= 1.0
+                if not sell_cooldown_ok:
+                    return
                 self.log.info(
                     f"[bot] EXIT {existing.side} mark={mark:.3f} "
                     f"unreal={unreal_pct:+.1%} held={seconds_held:.0f}s reason={ed.reason}"
                 )
                 sell = await self.executor.sell_to_close(existing.token_id, mark)
                 if sell.success:
+                    self._last_sell_fail_ts = 0.0
+                    self._last_sell_fail_reason = ""
+                    self._peak_unreal = 0.0
+                    # Rapid flip detection: a side-flip exit within 15s means the
+                    # market was in a highly unstable/flip-flopping state. Set a
+                    # 30s cooldown to prevent re-entering into the same instability.
+                    if ed.reason.startswith("side-flipped") and seconds_held < self._rapid_flip_hold_sec:
+                        self._last_rapid_flip_ts = time.time()
+                        self.log.info(
+                            f"[bot] rapid-flip detected (held={seconds_held:.0f}s<{self._rapid_flip_hold_sec:.0f}s) "
+                            f"— blocking entries for {self._rapid_flip_cooldown_sec:.0f}s"
+                        )
                     if self.positions.closed:
-                        self.risk.record_trade_pnl(self.positions.closed[-1].realized_pnl)
+                        pnl = self.positions.closed[-1].realized_pnl
+                        self.risk.record_trade_pnl(pnl)
+                        if pnl < 0:
+                            self._consecutive_losses += 1
+                            if self._consecutive_losses >= 2 and not self._window_trading_stopped:
+                                self._window_trading_stopped = True
+                                self.log.warning(
+                                    f"[bot] {self._consecutive_losses} consecutive losses "
+                                    "— stopping new entries for this window"
+                                )
+                        else:
+                            self._consecutive_losses = 0
                 else:
-                    self.log.warning(f"[bot] SELL FAILED {existing.side} — {sell.error}")
+                    self._last_sell_fail_ts = time.time()
+                    reason = sell.error or "unknown"
+                    if reason != self._last_sell_fail_reason:
+                        self._last_sell_fail_reason = reason
+                        self.log.warning(f"[bot] SELL FAILED {existing.side} — {reason}")
+                    # else: same failure reason, already logged — suppress duplicate
             return
 
         # ---- no position: check entry ----
@@ -297,6 +372,28 @@ class TradingBot:
         # Skip entry attempt entirely if executor is still cooling down after a failure.
         # The next tick will re-evaluate signals fresh — no log spam, no stale prices.
         if self.executor.in_cooldown():
+            return
+
+        # After 2 consecutive losses in this window, stop all new entries.
+        # Prevents overtrading when our signal direction is clearly wrong for
+        # this market — continuing to re-enter just compounds the losses.
+        if self._window_trading_stopped:
+            return
+
+        # Rapid flip cooldown: block re-entry for 30s after a side-flip exit
+        # that happened within 15s of entry. A rapid flip means the market was
+        # in an unstable/flip-flopping state — immediate re-entry almost always
+        # loses again (confirmed in live trading: 100% loss rate for entries
+        # within 5s of a rapid-flip exit).
+        elapsed_since_flip = time.time() - self._last_rapid_flip_ts
+        if elapsed_since_flip < self._rapid_flip_cooldown_sec:
+            remaining = self._rapid_flip_cooldown_sec - elapsed_since_flip
+            abort_key = "rapid-flip-cooldown"
+            if abort_key != self._last_abort_key:
+                self._last_abort_key = abort_key
+                self.log.info(
+                    f"[bot] entry blocked — rapid-flip cooldown active ({remaining:.0f}s remaining)"
+                )
             return
 
         decision = self.entry_engine.decide(
@@ -347,15 +444,36 @@ class TradingBot:
         decision_ask = decision.implied_ask or 0.5
         fresh_ask = self._ask_for(decision.token_id or "")
         if fresh_ask is None or fresh_ask <= 0:
-            self.log.info(f"[bot] entry aborted — fresh ask gone for {decision.side}")
+            abort_key = f"ask-gone:{decision.side}"
+            if abort_key != self._last_abort_key:
+                self._last_abort_key = abort_key
+                self.log.info(f"[bot] entry aborted — fresh ask gone for {decision.side}")
             return
         ask_drift = fresh_ask - decision_ask
         if ask_drift > ENTRY_MAX_DRIFT:
-            self.log.info(
-                f"[bot] entry aborted — ask drifted ${ask_drift:+.4f} "
-                f"({decision_ask:.3f} → {fresh_ask:.3f})"
-            )
+            abort_key = f"ask-drift:{decision.side}:{fresh_ask:.3f}"
+            if abort_key != self._last_abort_key:
+                self._last_abort_key = abort_key
+                self.log.info(
+                    f"[bot] entry aborted — ask drifted ${ask_drift:+.4f} "
+                    f"({decision_ask:.3f} → {fresh_ask:.3f})"
+                )
             return
+        # Cascade-drift gate: validate the fresh ask against the FIRST signal
+        # anchor for this (window, side). Without this, repeated FAK kills let
+        # the strategy chase a runaway book — each new entry signal at a higher
+        # price reset the per-call drift baseline. Anchor is recorded on first
+        # attempt and cleared on successful fill or window rollover.
+        anchor_ok, anchor_reason, anchor_ask = self.executor.check_signal_anchor(
+            m.window_ts, decision.side or "?", fresh_ask
+        )
+        if not anchor_ok:
+            abort_key = f"cascade:{decision.side}:{anchor_reason}"
+            if abort_key != self._last_abort_key:
+                self._last_abort_key = abort_key
+                self.log.info(f"[bot] entry aborted — {anchor_reason}")
+            return
+        self._last_abort_key = ""
         # Use the fresher ask for execution so the slippage cap reflects reality.
         execution_ask = fresh_ask
 
@@ -375,8 +493,15 @@ class TradingBot:
             market_window_ts=m.window_ts,
             get_fresh_ask=lambda: self._ask_for(target_token),
         )
-        if not fill.success:
-            self.log.warning(f"[bot] BUY FAILED {decision.side} — {fill.error}")
+        if fill.success:
+            self._last_buy_fail_reason = ""
+        else:
+            reason = fill.error or "unknown"
+            if reason != self._last_buy_fail_reason:
+                self._last_buy_fail_reason = reason
+                self.log.warning(f"[bot] BUY FAILED {decision.side} — {reason}")
+            # else: same error repeating every tick (e.g. post-sell-cooldown,
+            # cooldown) — already logged, suppress duplicate
 
     # ------------------------------------------------------------------ loop
     async def _strategy_loop(self) -> None:
@@ -408,6 +533,17 @@ class TradingBot:
                 # the candle open on the first Chainlink tick of the new window.
                 self._anchor_bucket_ms = -1
                 self._anchor_price = None
+                # Drop stale per-window signal anchors — every new window starts
+                # fresh, and stale anchors from a previous window must not gate
+                # new entries.
+                self.executor.clear_signal_anchors()
+                # Reset loss-stop counters so new window starts with full trading budget.
+                self._consecutive_losses = 0
+                self._window_trading_stopped = False
+                self._last_buy_fail_reason = ""
+                self._last_abort_key = ""
+                self._last_rapid_flip_ts = 0.0
+                self._peak_unreal = 0.0
                 await self._switch_to_window(win)
                 last_window = win
             try:
@@ -502,7 +638,7 @@ class TradingBot:
                     price_to_beat_str = f"${self.oracle.current_candle_open:,.2f}"
                     diff = self.oracle.latest_price - self.oracle.current_candle_open
                     color = G if diff > 0 else (R if diff < 0 else X)
-                    dir_icon = "ABOVE ▲" if diff > 0 else ("BELOW ▼" if diff < 0 else "FLAT ■")
+                    dir_icon = "UP ▲" if diff > 0 else ("DOWN ▼" if diff < 0 else "FLAT ■")
                     diff_str = f"{color}{diff:+.2f}{X}"
                     status_str = f"{color}{B}{dir_icon}{X}"
                 else:
@@ -510,8 +646,8 @@ class TradingBot:
                     diff_str = f"{Y}WAITING...{X}"
                     status_str = f"{Y}{B}WAITING NEXT CANDLE{X}"
 
-                daily_pnl = self.risk.pnl.realized
-                total_pnl = self.risk.total_pnl
+                daily_pnl = self.risk.balance_daily_pnl
+                total_pnl = self.risk.balance_total_pnl
                 daily_str = f"{G if daily_pnl >= 0 else R}{daily_pnl:+.2f}{X}"
                 total_str = f"{G if total_pnl >= 0 else R}{total_pnl:+.2f}{X}"
                 interval_min = int(self.oracle.interval_ms / 60000)
@@ -581,12 +717,23 @@ class TradingBot:
                     T + CLR,
                 ]
 
+                # Polymarket best ask (UP/DOWN) in cents — refreshed every 5 m window
+                poly_up_ask = None
+                poly_down_ask = None
+                if self._current_market:
+                    poly_up_ask = self._ask_for(self._current_market.up_token_id)
+                    poly_down_ask = self._ask_for(self._current_market.down_token_id)
+
+                up_ask_str = f"{G}{poly_up_ask * 100:.0f}¢{X}" if poly_up_ask else f"{Y}WAITING...{X}"
+                down_ask_str = f"{R}{poly_down_ask * 100:.0f}¢{X}" if poly_down_ask else f"{Y}WAITING...{X}"
+
                 # Price section with grid layout
                 table += [
                     f" {B}📊 PRICE FEEDS{X}" + CLR,
                     f" ┃ CEX Mid    {C}Binance:{X} {binance_str:<20}  {C}Coinbase:{X} {coinbase_str}" + CLR,
                     f" ┃ Chainlink  {C}Price:{X}   {B}{chainlink_str:<20}{X}  {C}Open:{X}  {B}{price_to_beat_str}{X}" + CLR,
                     f" ┃ Diff       {diff_str:<20}  {status_str:<15} {momentum_icon}" + CLR,
+                    f" ┃ Poly Ask   {G}UP:{X} {up_ask_str:<20}   {R}DOWN:{X} {down_ask_str}" + CLR,
                     T + CLR,
                 ]
 
@@ -632,7 +779,7 @@ class TradingBot:
                 table += [
                     f" {B}📈 PERFORMANCE{X}" + CLR,
                     f" ┃ Bankroll    ${bal:.2f}" + CLR,
-                    f" ┃ Daily P&L   {daily_profit_color}{daily_pnl:+.2f}{X}  ┃  Total P&L  {total_profit_color}{total_pnl:+.2f}{X}" + CLR,
+                    f" ┃ Daily P&L   {daily_profit_color}{daily_pnl:+.2f}{X}   ┃  Total P&L  {total_profit_color}{total_pnl:+.2f}{X}" + CLR,
                     f" ┃ Trades      {total_trades:<6}  ┃  Win Rate   {wr_bar}  {wr_val*100:.1f}%" + CLR,
                     f" ┃ Uptime      {run_str}" + CLR,
                     H + CLR,

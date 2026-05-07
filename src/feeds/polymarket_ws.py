@@ -48,6 +48,20 @@ class PolymarketBookFeed:
             except Exception as e:
                 log.warning(f"[polymarket-ws] re-subscribe failed: {e}")
 
+    async def restart(self, token_ids: Iterable[str] | None = None) -> None:
+        """Hard restart: stop, clear state, re-subscribe with new tokens.
+
+        Mirrors best_ask.py pattern — every new window gets a fresh WS
+        connection so the server pushes an initial snapshot immediately.
+        """
+        await self.stop()
+        self._stop.clear()
+        if token_ids is not None:
+            self.token_ids = list(token_ids)
+        self.books = {tid: {"bid": None, "ask": None} for tid in self.token_ids}
+        self._ws = None
+        await self.start()
+
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="polymarket-ws")
 
