@@ -17,6 +17,10 @@ class Position:
     realized_pnl: float = 0.0
     exit_price: float | None = None
     reconciled: bool = False  # True once on-chain balance confirms entry size/price
+    # Market-specific signing context — must match between buy and sell, else
+    # SELL signs against wrong exchange contract and gets 400 "signer address".
+    neg_risk: bool = False
+    tick_size: float = 0.01
 
     def unrealized_pnl(self, mark_price: float) -> float:
         return (mark_price - self.entry_price) * self.size_shares

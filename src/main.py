@@ -28,6 +28,8 @@ from .utils.time_utils import (
 
 # Refresh bankroll every N ticks (400ms/tick → ~40s refresh)
 _BANKROLL_REFRESH_TICKS = 100
+# Log order outcome counter summary every N ticks (~120s @ 50ms watchdog)
+_COUNTER_LOG_TICKS = 2400
 
 
 class TradingBot:
@@ -51,6 +53,10 @@ class TradingBot:
             self.s.polymarket_ws, token_ids=[], on_book=self._on_poly_book
         )
         self._poly_books: dict[str, dict] = {}
+        # Event-driven tick: WS book-update callback sets this so the strategy
+        # loop re-evaluates immediately instead of waiting up to 50ms. Watchdog
+        # timeout (100ms) still fires for non-WS conditions (window rollover etc).
+        self._tick_event: asyncio.Event = asyncio.Event()
 
         self.discovery = MarketDiscovery(self.s.gamma_host)
         self.clob = PolymarketClobClient(self.s)
@@ -121,6 +127,9 @@ class TradingBot:
             "last_ask": last_ask, "last_bid": last_bid,
             "ts": ts,
         }
+        # Wake the strategy loop immediately on any book change so signals fire
+        # within ~5ms of the WS update instead of waiting for the 50ms watchdog.
+        self._tick_event.set()
 
     # ------------------------------------------------------------------ anchor / window
     def _try_lock_anchor(self) -> bool:
@@ -285,6 +294,18 @@ class TradingBot:
         self._tick_count += 1
         if self._tick_count % _BANKROLL_REFRESH_TICKS == 1:
             await self._refresh_bankroll()
+        if self._tick_count % _COUNTER_LOG_TICKS == 0:
+            c = self.executor.counters_snapshot()
+            total_buy = c["buy_filled"] + c["buy_fak_killed"] + c["buy_timeout"] + c["buy_rejected"]
+            total_sell = c["sell_filled"] + c["sell_fak_killed"] + c["sell_failed"]
+            buy_rate = (c["buy_filled"] / total_buy * 100) if total_buy else 0.0
+            sell_rate = (c["sell_filled"] / total_sell * 100) if total_sell else 0.0
+            self.log.info(
+                f"[exec.stats] BUY filled={c['buy_filled']} fak={c['buy_fak_killed']} "
+                f"timeout={c['buy_timeout']} ghost={c['buy_ghost']} rejected={c['buy_rejected']} "
+                f"(success={buy_rate:.0f}%) | SELL filled={c['sell_filled']} "
+                f"fak={c['sell_fak_killed']} failed={c['sell_failed']} (success={sell_rate:.0f}%)"
+            )
 
         mom = self.momentum.read(now)
         ll = self.leadlag.read(now)
@@ -429,6 +450,12 @@ class TradingBot:
         if not decision.enter:
             return
 
+        # Capture signal timestamp NOW so buy_to_open can enforce the 2s
+        # signal-to-fill budget across all subsequent work (re-validation,
+        # API call, ghost-fill check). Anything that happens after this point
+        # eats into the budget.
+        signal_ts_monotonic = time.monotonic()
+
         win_prob = misp.fair_p_up if decision.side == "UP" else (1.0 - misp.fair_p_up)
         size_usd = self.risk.position_size_usd(decision.edge, decision.implied_ask or 0.5, win_prob)
         if size_usd < self.s.min_bet_usd:
@@ -491,7 +518,10 @@ class TradingBot:
             usd_amount=size_usd,
             expected_ask=execution_ask,
             market_window_ts=m.window_ts,
+            neg_risk=m.neg_risk,
+            tick_size=m.tick_size,
             get_fresh_ask=lambda: self._ask_for(target_token),
+            signal_ts_monotonic=signal_ts_monotonic,
         )
         if fill.success:
             self._last_buy_fail_reason = ""
@@ -550,9 +580,15 @@ class TradingBot:
                 await self._tick()
             except Exception as e:
                 self.log.exception(f"[bot] tick error: {e}")
-            # Evaluasi strategi dijalankan dengan interval sangat rapat (50ms)
-            # agar reaksi terhadap perubahan harga (mispricing/lead-lag) nyaris instan.
-            await asyncio.sleep(0.05)
+            # Event-driven trigger: re-evaluate immediately on any WS book update,
+            # otherwise wake every 100ms as a watchdog (window rollover, oracle
+            # ticks, etc.). Coalesce multiple WS updates into one tick by clearing
+            # before the wait — bursts collapse to a single re-evaluation.
+            self._tick_event.clear()
+            try:
+                await asyncio.wait_for(self._tick_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
 
     async def _display_loop(self) -> None:
         """

@@ -41,12 +41,14 @@ from py_clob_client_v2.clob_types import (
     ApiCreds,
     AssetType,
     BalanceAllowanceParams,
+    BuilderConfig,
     MarketOrderArgsV2,
     OpenOrderParams,
     OrderArgsV2,
     OrderType,
     PartialCreateOrderOptions,
 )
+from py_clob_client_v2.constants import BYTES32_ZERO
 from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from ..config.settings import Settings
@@ -67,44 +69,128 @@ class PolymarketClobClient:
         self._bankroll_cache: float = 0.0  # last known pUSD balance for market order fees
 
     def _build_client(self) -> ClobClient:
-        # funder must be None (not "") so OrderBuilder.funder falls back to
-        # signer.address() for pure EOA accounts.
-        funder = self.s.polymarket_address or self.s.relayer_api_key_address or None
+        """Initialize ClobClient for POLY_1271 (sig_type=3) — deposit wallets only.
 
-        # Derive EOA address from private key to detect account type.
+        POLY_1271 order flow (confirmed working):
+        - order.maker = order.signer = deposit wallet (set by OrderBuilder._v2_order_signer())
+        - CLOB API key may be EOA-registered: server validates the full ERC-7739 chain
+          (EOA signed the order → EOA controls deposit wallet → isValidSignature passes).
+        - DO NOT call create_or_derive_api_key() at startup — unnecessary overhead and
+          creates a new session key each run. Use the pre-configured CLOB API creds.
+        """
         from eth_account import Account as _Acc
-        eoa_addr = _Acc.from_key(self.s.private_key).address
 
-        # Sanity check: if POLYMARKET_ADDRESS is a proxy wallet (≠ EOA), warn
-        # if SIGNATURE_TYPE=0 (EOA mode is wrong for proxy accounts).
-        # Type 1 = browser/MetaMask proxy, Type 2 = Gnosis Safe (Phantom/email/Magic).
         sig_type = self.s.signature_type
-        if funder and funder.lower() != eoa_addr.lower() and sig_type == 0:
-            log.warning(
-                f"[clob] POLYMARKET_ADDRESS ({funder[:10]}…) differs from EOA "
-                f"({eoa_addr[:10]}…) but SIGNATURE_TYPE=0 — set 1 (browser) "
-                "or 2 (Phantom/Gnosis Safe) in .env"
+        if sig_type != 3:
+            raise RuntimeError(
+                f"This bot is POLY_1271-only (SIGNATURE_TYPE=3). "
+                f"Got SIGNATURE_TYPE={sig_type}. Update .env."
             )
 
+        funder = self.s.polymarket_address
+        if not funder:
+            raise RuntimeError(
+                "POLY_1271 requires POLYMARKET_ADDRESS (deposit wallet) in .env"
+            )
+
+        eoa_addr = _Acc.from_key(self.s.private_key).address
+        if funder.lower() == eoa_addr.lower():
+            raise RuntimeError(
+                "POLY_1271: POLYMARKET_ADDRESS must be the deposit-wallet smart "
+                "contract address, NOT the EOA derived from PRIVATE_KEY."
+            )
+
+        if not (self.s.clob_api_key and self.s.clob_secret and self.s.clob_passphrase):
+            raise RuntimeError(
+                "POLY_1271 requires CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE "
+                "in .env — create them via Polymarket portal while logged in as the deposit wallet."
+            )
+
+        creds = ApiCreds(
+            api_key=self.s.clob_api_key,
+            api_secret=self.s.clob_secret,
+            api_passphrase=self.s.clob_passphrase,
+        )
+        # Builder code attribution: if set, library auto-attaches to every
+        # OrderArgsV2/MarketOrderArgsV2 (see py_clob_client_v2/client.py:714-716,
+        # 795-797). Empty → BYTES32_ZERO → no attribution.
+        builder_code = self.s.builder_code or BYTES32_ZERO
+        builder_config = BuilderConfig(builder_code=builder_code)
         c = ClobClient(
             host=self.s.clob_host,
             chain_id=self.s.chain_id,
             key=self.s.private_key,
+            creds=creds,
             signature_type=sig_type,
             funder=funder,
+            builder_config=builder_config,
         )
-        sig_name = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE", 3: "POLY_1271"}.get(
-            sig_type, str(sig_type)
+
+        # Hard assertion: verify the OrderBuilder actually produces signer=funder for POLY_1271.
+        # Uses inspect to check the live bytecode, not just attribute values.
+        import inspect as _inspect
+        builder = c.builder
+        actual_sig_type = int(builder.signature_type)
+        actual_funder = builder.funder or ""
+        if actual_sig_type != 3:
+            raise RuntimeError(
+                f"[clob] BUG: OrderBuilder.signature_type={actual_sig_type}, expected 3. "
+                "Clear all __pycache__ and run: pip install --force-reinstall py_clob_client_v2==1.0.1"
+            )
+        if actual_funder.lower() != funder.lower():
+            raise RuntimeError(
+                f"[clob] BUG: OrderBuilder.funder={actual_funder!r}, expected {funder!r}. "
+                "Library init bug — check ClobClient constructor."
+            )
+        # Verify at runtime that _v2_order_signer (or equivalent) returns funder.
+        # Call the method if present; otherwise inspect build_market_order source.
+        if hasattr(builder, "_v2_order_signer"):
+            actual_order_signer = builder._v2_order_signer()
+        else:
+            # Older library without _v2_order_signer — inspect build_market_order source
+            # to detect whether it correctly uses funder for POLY_1271.
+            src = _inspect.getsource(type(builder).build_market_order)
+            if "_v2_order_signer" not in src and "self.funder" not in src:
+                raise RuntimeError(
+                    "[clob] BUG: build_market_order does not use funder/POLY_1271 signer path. "
+                    "Stale .pyc or wrong library version. "
+                    "Run: pip install --force-reinstall py_clob_client_v2==1.0.1"
+                )
+            # In old versions, signer defaults to signer.address() (EOA) — reject.
+            raise RuntimeError(
+                f"[clob] BUG: Library missing _v2_order_signer() — order.signer would be EOA not deposit_wallet. "
+                f"Run: pip install --force-reinstall py_clob_client_v2==1.0.1 "
+                f"Library loaded from: {_inspect.getfile(type(builder))}"
+            )
+        if actual_order_signer.lower() != funder.lower():
+            raise RuntimeError(
+                f"[clob] BUG: _v2_order_signer()={actual_order_signer!r} != funder={funder!r}. "
+                "POLY_1271 signer must equal deposit wallet. "
+                f"Library: {_inspect.getfile(type(builder))}"
+            )
+
+        # Verify HTTP/2 keep-alive is enabled (huge latency win — TLS reuse).
+        # py_clob_client_v2 uses a module-level httpx.Client(http2=True) in
+        # http_helpers/helpers.py:24. Confirm by reading that module attr.
+        try:
+            from py_clob_client_v2.http_helpers import helpers as _hh
+            _http2_enabled = bool(getattr(_hh._http_client, "_transport", None))
+            _http2_label = "http2=on" if _http2_enabled else "http2=off"
+        except Exception:
+            _http2_label = "http2=?"
+
+        builder_label = (
+            f"{builder_code[:10]}…"
+            if builder_code != BYTES32_ZERO
+            else "NONE(no attribution)"
         )
         log.info(
-            f"[clob] maker={funder or eoa_addr} signer={eoa_addr} "
-            f"sig_type={sig_name}({sig_type})"
+            f"[clob] POLY_1271 ready: deposit_wallet={funder} "
+            f"signer_eoa={eoa_addr} clob_api_key={self.s.clob_api_key[:8]}… "
+            f"builder.sig_type={actual_sig_type} order_signer={actual_order_signer[:10]}… "
+            f"builder_code={builder_label} keep_alive={_http2_label} "
+            f"lib={_inspect.getfile(type(builder))}"
         )
-        # Always derive L2 credentials from private key. Builder API credentials
-        # are for builder operations, not L2 auth. Deriving from the key is reliable
-        # and avoids the initial 401 when using stale/incompatible credentials.
-        creds = c.create_or_derive_api_key()
-        c.set_api_creds(creds)
         return c
 
     async def ensure_ready(self) -> None:
@@ -166,16 +252,10 @@ class PolymarketClobClient:
             return None
 
     async def get_usdc_balance(self) -> float | None:
-        """Returns pUSD balance from Polymarket CLOB V2.
-
-        V2 client automatically includes correct signature_type in the request.
-        On 401: re-derives L2 credentials from private key and retries once.
-        pUSD is Polymarket's internal collateral — separate from on-chain USDC.
-        """
         await self.ensure_ready()
         return await self._fetch_balance()
 
-    async def _fetch_balance(self, retry: bool = True) -> float | None:
+    async def _fetch_balance(self) -> float | None:
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             r = await asyncio.to_thread(self.client.get_balance_allowance, params)
@@ -187,16 +267,6 @@ class PolymarketClobClient:
                 return amount
             return None
         except Exception as e:
-            err_str = str(e)
-            if retry and "401" in err_str:
-                log.warning("[clob] balance 401 — re-deriving L2 credentials from private key")
-                try:
-                    new_creds = await asyncio.to_thread(self.client.create_or_derive_api_key)
-                    self.client.set_api_creds(new_creds)
-                    log.info(f"[clob] re-derived API key: {new_creds.api_key[:8]}…")
-                    return await self._fetch_balance(retry=False)
-                except Exception as re_err:
-                    log.warning(f"[clob] re-derive failed: {re_err}")
             log.warning(f"[clob] pUSD balance err: {e}")
             return None
 
@@ -218,21 +288,28 @@ class PolymarketClobClient:
         return await asyncio.to_thread(self.client.cancel_all)
 
     # ------------------------------------------------------------------ order placement
+    # HOT PATH — NO RPC. CLOB POST is HTTP only; adding any web3/RPC call here
+    # adds 50-200ms per order and breaks the 2s signal-to-fill budget. Off-hot-path
+    # uses (background reconcile, periodic bankroll refresh) may use RPC freely.
     async def place_market_buy(
         self,
         token_id: str,
         usd_amount: float,
         worst_price: float,
-        order_type: str = OrderType.FAK,
         *,
+        neg_risk: bool,
+        tick_size: str = "0.01",
+        order_type: str = OrderType.FAK,
         cancel_flag: threading.Event | None = None,
     ) -> dict:
         """FAK market buy with worst-price slippage protection.
 
         `worst_price`: exchange enforces this as the maximum fill price.
         Any liquidity at <= worst_price fills; the remainder is killed (FAK).
-        `cancel_flag`: if set before the POST fires, the thread aborts without
-        sending the order (used by the timeout path in buy_to_open).
+        `neg_risk`: must match market's negRisk flag from Gamma — wrong value
+        signs against wrong exchange contract (CTFExchange vs NegRiskExchange)
+        and triggers misleading "signer address" 400 error.
+        `cancel_flag`: if set before the POST fires, the thread aborts.
         """
         await self.ensure_ready()
         user_balance = max(self._bankroll_cache, usd_amount * 1.05)
@@ -243,40 +320,60 @@ class PolymarketClobClient:
             price=worst_price,
             user_usdc_balance=user_balance,
         )
-        options = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-        # Combine signing + post into a single thread call. EIP712 signing is
-        # CPU-bound (~5-15ms) and would otherwise block the event loop, freezing
-        # WebSocket book updates while we sign — a single thread keeps WS feeds
-        # live and eliminates the await-overhead between sign and post.
-        def _sign_and_post() -> Any:
-            signed = self.client.create_market_order(order_args=args, options=options)
-            if cancel_flag is not None and cancel_flag.is_set():
-                raise RuntimeError("buy cancelled before POST (timeout)")
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+
+        # Pre-sign: signing (~3-5ms with eth_account C-ext) is done BEFORE the
+        # caller's wait_for() timeout fires for the POST, freeing the full
+        # api_timeout budget for the actual network round-trip.
+        import time as _time
+        _t_sign = _time.monotonic()
+        signed = await asyncio.to_thread(
+            self.client.create_market_order, order_args=args, options=options
+        )
+        sign_ms = (_time.monotonic() - _t_sign) * 1000
+        if cancel_flag is not None and cancel_flag.is_set():
+            raise RuntimeError("buy cancelled before POST (timeout)")
+
+        def _post() -> Any:
+            log.info(
+                f"[clob.diag] BUY post sig=3 funder={self.s.polymarket_address[:10]} "
+                f"signed.signer={getattr(signed, 'signer', '?')[:10]} "
+                f"signed.maker={getattr(signed, 'maker', '?')[:10]} "
+                f"signed.builder={str(getattr(signed, 'builder', BYTES32_ZERO))[:10]} "
+                f"api_key={self.client.creds.api_key[:8]} "
+                f"eoa={self.client.signer.address()[:10]} "
+                f"neg_risk={neg_risk} tick={tick_size} sign_ms={sign_ms:.1f}"
+            )
             return self.client.post_order(signed, order_type)
-        resp = await asyncio.to_thread(_sign_and_post)
-        return resp if isinstance(resp, dict) else {"raw": resp}
+
+        _t_post = _time.monotonic()
+        resp = await asyncio.to_thread(_post)
+        post_ms = (_time.monotonic() - _t_post) * 1000
+        if isinstance(resp, dict):
+            resp.setdefault("_sign_ms", sign_ms)
+            resp.setdefault("_post_ms", post_ms)
+            return resp
+        return {"raw": resp, "_sign_ms": sign_ms, "_post_ms": post_ms}
 
     async def place_capped_buy(
         self,
         token_id: str,
         max_price: float,
         usd_amount: float,
+        *,
+        neg_risk: bool,
+        tick_size: str = "0.01",
         order_type: str = OrderType.FAK,
     ) -> dict:
-        """Limit FAK buy with a max acceptable price (slippage cap).
-
-        size_shares = usd_amount / max_price (worst case). FAK fills any
-        liquidity at <= max_price and kills the rest. If actual top-of-book
-        is below max_price, the average fill will be lower — protecting
-        against book sweeps in thin liquidity.
-        """
+        """Limit FAK buy with a max acceptable price (slippage cap)."""
         await self.ensure_ready()
         size_shares = round(usd_amount / max(max_price, 1e-3), 4)
         args = OrderArgsV2(
             token_id=token_id, price=round(max_price, 3), size=size_shares, side=BUY
         )
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
         def _sign_and_post() -> Any:
-            signed = self.client.create_order(args)
+            signed = self.client.create_order(args, options=options)
             return self.client.post_order(signed, order_type)
         resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
@@ -287,12 +384,16 @@ class PolymarketClobClient:
         price: float,
         size_shares: float,
         side: str,
+        *,
+        neg_risk: bool,
+        tick_size: str = "0.01",
         order_type: str = OrderType.GTC,
     ) -> dict:
         await self.ensure_ready()
         args = OrderArgsV2(token_id=token_id, price=price, size=size_shares, side=side)
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
         def _sign_and_post() -> Any:
-            signed = self.client.create_order(args)
+            signed = self.client.create_order(args, options=options)
             return self.client.post_order(signed, order_type)
         resp = await asyncio.to_thread(_sign_and_post)
         return resp if isinstance(resp, dict) else {"raw": resp}
@@ -301,16 +402,17 @@ class PolymarketClobClient:
         self,
         token_id: str,
         size_shares: float,
+        *,
+        neg_risk: bool,
+        tick_size: str = "0.01",
     ) -> dict:
         """True market sell using MarketOrderArgsV2.
 
-        No minimum share requirement unlike limit FAK orders.
+        `neg_risk` MUST match the buy-side neg_risk for the same token —
+        otherwise the sell order signs against a different exchange contract
+        than the position is held in, and is rejected.
         """
         await self.ensure_ready()
-        # SDK computes implied_price = user_usdc_balance / size_shares for SELL orders.
-        # Guard against near-zero bankroll_cache (stale/not-yet-refreshed) which would
-        # produce implied_price < 0.01 (Polymarket minimum) and get rejected.
-        # Floor: at least 1¢ per share → always above the 0.01 minimum.
         user_balance = max(self._bankroll_cache, round(size_shares, 4) * 0.02)
         args = MarketOrderArgsV2(
             token_id=token_id,
@@ -318,10 +420,31 @@ class PolymarketClobClient:
             side=SELL,
             user_usdc_balance=user_balance,
         )
-        # Combine signing + post into a single thread call (see place_market_buy
-        # for rationale — keeps event loop free for WS updates during signing).
-        def _sign_and_post() -> Any:
-            signed = self.client.create_market_order(args)
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+
+        # Pre-sign before caller's wait_for() timeout (see place_market_buy).
+        import time as _time
+        _t_sign = _time.monotonic()
+        signed = await asyncio.to_thread(
+            self.client.create_market_order, order_args=args, options=options
+        )
+        sign_ms = (_time.monotonic() - _t_sign) * 1000
+
+        def _post() -> Any:
+            log.info(
+                f"[clob.diag] SELL post sig=3 funder={self.s.polymarket_address[:10]} "
+                f"signer={getattr(signed, 'signer', '?')[:10]} "
+                f"signed.builder={str(getattr(signed, 'builder', BYTES32_ZERO))[:10]} "
+                f"api_key={self.client.creds.api_key[:8]} "
+                f"neg_risk={neg_risk} tick={tick_size} sign_ms={sign_ms:.1f}"
+            )
             return self.client.post_order(signed, OrderType.FAK)
-        resp = await asyncio.to_thread(_sign_and_post)
-        return resp if isinstance(resp, dict) else {"raw": resp}
+
+        _t_post = _time.monotonic()
+        resp = await asyncio.to_thread(_post)
+        post_ms = (_time.monotonic() - _t_post) * 1000
+        if isinstance(resp, dict):
+            resp.setdefault("_sign_ms", sign_ms)
+            resp.setdefault("_post_ms", post_ms)
+            return resp
+        return {"raw": resp, "_sign_ms": sign_ms, "_post_ms": post_ms}

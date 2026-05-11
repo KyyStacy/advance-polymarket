@@ -44,10 +44,18 @@ class Settings:
     relayer_api_key: str
     relayer_api_key_address: str
 
-    # Builder API creds
+    # CLOB API creds (L2 auth on /order endpoint)
+    clob_api_key: str
+    clob_secret: str
+    clob_passphrase: str
+
+    # Builder API creds (HMAC, from Polymarket UI — future use for gasless relayer)
     builder_api_key: str
     builder_secret: str
     builder_passphrase: str
+    # Builder code (bytes32 hex) — applied to every order for fee attribution.
+    # Empty string means no attribution (legacy behavior).
+    builder_code: str
 
     # Network / clob
     signature_type: int
@@ -102,10 +110,14 @@ def load_settings(env_path: str | None = None) -> Settings:
         polymarket_address=_env("POLYMARKET_ADDRESS", ""),
         relayer_api_key=_env("RELAYER_API_KEY", ""),
         relayer_api_key_address=_env("RELAYER_API_KEY_ADDRESS", ""),
+        clob_api_key=_env("CLOB_API_KEY", ""),
+        clob_secret=_env("CLOB_SECRET", ""),
+        clob_passphrase=_env("CLOB_PASSPHRASE", ""),
         builder_api_key=_env("BUILDER_API_KEY", ""),
         builder_secret=_env("BUILDER_SECRET", ""),
         builder_passphrase=_env("BUILDER_PASSPHRASE", ""),
-        signature_type=_envi("SIGNATURE_TYPE", 0),
+        builder_code=_env("BUILDER_CODE", ""),
+        signature_type=_envi("SIGNATURE_TYPE", 3),
         chain_id=_envi("CHAIN_ID", 137),
         clob_host=_env("CLOB_HOST", "https://clob.polymarket.com"),
         gamma_host=_env("GAMMA_HOST", "https://gamma-api.polymarket.com"),
@@ -137,4 +149,44 @@ def load_settings(env_path: str | None = None) -> Settings:
         log_file=_env("LOG_FILE", "logs/bot.log"),
         project_root=root,
     )
+    # POLY_1271-only enforcement. The bot signs orders with sig_type=3
+    # (deposit wallet) and uses CLOB_* API creds bound to that wallet.
+    # Any other sig_type would mismatch the order.signer field and trigger
+    # "the order signer address has to be the address of the API KEY".
+    if s.signature_type != 3:
+        raise RuntimeError(
+            f"SIGNATURE_TYPE must be 3 (POLY_1271). Got {s.signature_type}. "
+            "This bot only supports Polymarket deposit wallets."
+        )
+    if not s.polymarket_address:
+        raise RuntimeError(
+            "POLYMARKET_ADDRESS (deposit wallet address) is required for POLY_1271."
+        )
+    if not (s.clob_api_key and s.clob_secret and s.clob_passphrase):
+        raise RuntimeError(
+            "CLOB_API_KEY / CLOB_SECRET / CLOB_PASSPHRASE are required. "
+            "Create them via Polymarket portal while logged in as the deposit wallet."
+        )
+    # UUID format guard: a single missing/extra char silently breaks server auth
+    # and surfaces as misleading "the order signer address has to be the address
+    # of the API KEY" errors. Validate format up-front.
+    import re as _re
+    _UUID_RE = _re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    if not _UUID_RE.match(s.clob_api_key):
+        raise RuntimeError(
+            f"CLOB_API_KEY is not a valid UUID: {s.clob_api_key!r}. "
+            "Expected format: 8-4-4-4-12 hex chars (e.g. '3a9cbad0-7cc6-8950-b8d9-09902171e128'). "
+            "Check .env for typos."
+        )
+    # BUILDER_CODE is optional but if set must be a valid bytes32 hex.
+    # Empty string disables attribution (legacy behavior). Non-empty but malformed
+    # would silently produce orders with garbage builder field — reject up-front.
+    if s.builder_code:
+        _BYTES32_RE = _re.compile(r"^0x[0-9a-fA-F]{64}$")
+        if not _BYTES32_RE.match(s.builder_code):
+            raise RuntimeError(
+                f"BUILDER_CODE is not a valid bytes32 hex: {s.builder_code!r}. "
+                "Expected format: '0x' + 64 hex chars (e.g. '0x0000...000abc'). "
+                "Get it from Polymarket portal under Builder section."
+            )
     return s

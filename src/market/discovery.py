@@ -22,6 +22,7 @@ class MarketInfo:
     down_token_id: str
     tick_size: float
     minimum_order_size: float
+    neg_risk: bool
 
     @property
     def tokens(self) -> list[str]:
@@ -103,6 +104,11 @@ class MarketDiscovery:
             down_idx = 1 - up_idx if len(outcomes) >= 2 else 1
             up_token = str(token_ids[up_idx])
             down_token = str(token_ids[down_idx])
+            neg_risk = bool(m.get("negRisk", False))
+            if neg_risk:
+                log.warning(
+                    f"[gamma] {slug}: negRisk=True — orders must use NegRiskExchange contract"
+                )
             return MarketInfo(
                 condition_id=str(m.get("conditionId") or m.get("condition_id") or ""),
                 slug=str(m.get("slug") or slug),
@@ -113,6 +119,7 @@ class MarketDiscovery:
                 down_token_id=down_token,
                 tick_size=float(m.get("orderPriceMinTickSize") or 0.01),
                 minimum_order_size=float(m.get("orderMinSize") or 5.0),
+                neg_risk=neg_risk,
             )
         except Exception as e:
             log.warning(f"[gamma] parse {slug} failed: {e}")
