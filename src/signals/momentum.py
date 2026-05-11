@@ -25,15 +25,37 @@ class MomentumAnalyzer:
     Direction confirmed when 30s and 60s returns agree in sign and z_score >= threshold.
     """
 
+    # Cache TTL: re-reading more frequently than this rarely changes the answer
+    # (CEX mid usually updates every 50–200ms; momentum stats over 60s window
+    # are dominated by older ticks). Avoids 5–10ms of numpy work per strategy
+    # tick when called repeatedly within the same event-loop slice.
+    _CACHE_TTL_SEC = 0.050
+
     def __init__(self, agg: PriceAggregator):
         self.agg = agg
+        self._cache: MomentumReading | None = None
+        self._cache_ts: float = 0.0
+        self._cache_last_t: float = 0.0
+        self._cache_size: int = 0
 
     def read(self, now: float | None = None) -> MomentumReading:
         now = now if now is not None else time.time()
 
+        # Latest item peek is O(1) on a deque; skip the full window snapshot
+        # if nothing new arrived since the last compute AND cache is fresh.
+        if self._cache is not None and (now - self._cache_ts) < self._CACHE_TTL_SEC:
+            latest = self.agg.cex_mid.latest()
+            if latest is not None and latest[0] == self._cache_last_t:
+                return self._cache
+
         items = list(self.agg.cex_mid.items_in_window(60.0, now))
         if len(items) < 12:
-            return MomentumReading(0, 0.0, 0.0, 0.0, 0.0)
+            empty = MomentumReading(0, 0.0, 0.0, 0.0, 0.0)
+            self._cache = empty
+            self._cache_ts = now
+            self._cache_last_t = items[-1][0] if items else 0.0
+            self._cache_size = len(items)
+            return empty
 
         ts = np.array([t for t, _ in items])
         px = np.array([p for _, p in items])
@@ -79,4 +101,9 @@ class MomentumAnalyzer:
         else:
             direction = 0
 
-        return MomentumReading(direction, z, r30, r60, accel)
+        reading = MomentumReading(direction, z, r30, r60, accel)
+        self._cache = reading
+        self._cache_ts = now
+        self._cache_last_t = float(ts[-1])
+        self._cache_size = len(items)
+        return reading

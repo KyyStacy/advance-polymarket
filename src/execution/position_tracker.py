@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -30,25 +31,41 @@ class Position:
 class PositionTracker:
     open: dict[str, Position] = field(default_factory=dict)
     closed: list[Position] = field(default_factory=list)
+    # Guards compound mutations + iteration vs background reconcile tasks.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add(self, p: Position) -> None:
-        self.open[p.token_id] = p
+        with self._lock:
+            self.open[p.token_id] = p
 
     def close(self, token_id: str, exit_price: float) -> Position | None:
-        p = self.open.pop(token_id, None)
-        if not p:
-            return None
-        p.closed = True
-        p.exit_price = exit_price
-        p.realized_pnl = (exit_price - p.entry_price) * p.size_shares
-        self.closed.append(p)
-        return p
+        with self._lock:
+            p = self.open.pop(token_id, None)
+            if not p:
+                return None
+            p.closed = True
+            p.exit_price = exit_price
+            p.realized_pnl = (exit_price - p.entry_price) * p.size_shares
+            self.closed.append(p)
+            return p
+
+    def pop_open(self, token_id: str) -> Position | None:
+        """Safe alternative to `tracker.open.pop(token_id, None)`."""
+        with self._lock:
+            return self.open.pop(token_id, None)
+
+    def snapshot_open(self) -> list[Position]:
+        """Return a list copy of open positions safe to iterate across awaits."""
+        with self._lock:
+            return list(self.open.values())
 
     def has_open_for_window(self, window_ts: int) -> bool:
-        return any(p.market_window_ts == window_ts for p in self.open.values())
+        with self._lock:
+            return any(p.market_window_ts == window_ts for p in self.open.values())
 
     def get_for_window(self, window_ts: int) -> Position | None:
-        for p in self.open.values():
-            if p.market_window_ts == window_ts:
-                return p
-        return None
+        with self._lock:
+            for p in self.open.values():
+                if p.market_window_ts == window_ts:
+                    return p
+            return None

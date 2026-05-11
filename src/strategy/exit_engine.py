@@ -34,11 +34,20 @@ class ExitEngine:
         - Edge collapse / lead-lag convergence
     """
 
-    STALE_EXIT_SECONDS = 30.0
+    # 30s was too permissive — Polymarket book heartbeats every 2–5s, so a
+    # 10s silence almost always means a real disconnect, not a normal pause.
+    # Tighter threshold triggers stale-exit 3× faster on actual feed loss.
+    STALE_EXIT_SECONDS = 10.0
     # Minimum hold time after entry before signal-based exits can fire.
     # Without this, z dropping from 2.94→1.83 in 12s (noise reversion) was
     # triggering exits seconds after entry on strong signal.
     MIN_HOLD_SECONDS = 45.0
+    # Hard floor against own-fill adverse selection: own market buy moves the
+    # ask and immediately tilts the fair-probability estimate against us. Side
+    # flip / take-profit can otherwise fire on the same tick as the fill and
+    # lock in 50–200bps loss before the market has even acked our trade.
+    # This window is tiny (1s) but enough for the book to settle post-fill.
+    OWN_FILL_GRACE_SECONDS = 1.0
     # Hard take-profit: only at extreme gains (300%) as a safety ceiling.
     # Primary profit-protection is the trailing stop below — this hard cap
     # is intentionally high so 150-200% runs are not cut prematurely.
@@ -100,6 +109,16 @@ class ExitEngine:
                 return ExitDecision(True, f"book-stale>{self.STALE_EXIT_SECONDS:.0f}s")
             return ExitDecision(False, "no-mispricing-data-yet")
         self._last_mispricing_ts = now
+
+        # Own-fill grace: block all signal-driven exits in the first 1s after
+        # entry. Only time-floor (above) bypasses this — book-stale and signal
+        # exits all wait for the book to settle. Prevents adverse selection
+        # from our own market buy snapping fair_p_up against us instantly.
+        if seconds_held < self.OWN_FILL_GRACE_SECONDS:
+            return ExitDecision(
+                False,
+                f"hold[own-fill-grace] {seconds_held:.2f}s<{self.OWN_FILL_GRACE_SECONDS:.1f}s"
+            )
 
         in_profit = unrealized_pct >= self.PROFIT_HOLD_PCT
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from typing import Callable
 
@@ -73,6 +74,9 @@ class BinanceFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning(f"[binance] disconnect: {e}; retry in {backoff:.1f}s")
-                await asyncio.sleep(backoff)
+                # Jitter prevents synchronized reconnect storms when multiple
+                # bots / clients drop at once. Floor at 0.2s for fast recovery.
+                wait = max(0.2, backoff + random.uniform(0.0, 0.5))
+                log.warning(f"[binance] disconnect: {e}; retry in {wait:.2f}s")
+                await asyncio.sleep(wait)
                 backoff = min(backoff * 2, 30.0)

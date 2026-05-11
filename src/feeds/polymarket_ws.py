@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from typing import Callable, Iterable
 
@@ -30,6 +31,11 @@ class PolymarketBookFeed:
         self.on_book = on_book
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Signalled whenever token_ids becomes non-empty, so _run() can wake
+        # immediately instead of sleeping a fixed 500ms window.
+        self._tokens_ready = asyncio.Event()
+        if self.token_ids:
+            self._tokens_ready.set()
         self.books: dict[str, dict] = {tid: {"bid": None, "ask": None} for tid in self.token_ids}
         self._ws: object | None = None  # live WS connection, None when disconnected
 
@@ -37,6 +43,10 @@ class PolymarketBookFeed:
         self.token_ids = list(token_ids)
         for tid in self.token_ids:
             self.books.setdefault(tid, {"bid": None, "ask": None})
+        if self.token_ids:
+            self._tokens_ready.set()
+        else:
+            self._tokens_ready.clear()
         # Re-subscribe on the live connection so new tokens stream immediately.
         # Without this, the server keeps sending old-token updates only and the
         # new market window gets no bid/ask data until the next reconnect.
@@ -78,7 +88,12 @@ class PolymarketBookFeed:
         backoff = 1.0
         while not self._stop.is_set():
             if not self.token_ids:
-                await asyncio.sleep(0.5)
+                # Event-driven wait: zero stale window when tokens arrive
+                # (previous code slept a hard 500ms regardless).
+                try:
+                    await asyncio.wait_for(self._tokens_ready.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 continue
             try:
                 async with websockets.connect(
@@ -118,8 +133,9 @@ class PolymarketBookFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning(f"[polymarket-ws] disconnect: {e}; retry {backoff:.1f}s")
-                await asyncio.sleep(backoff)
+                wait = max(0.2, backoff + random.uniform(0.0, 0.5))
+                log.warning(f"[polymarket-ws] disconnect: {e}; retry {wait:.2f}s")
+                await asyncio.sleep(wait)
                 backoff = min(backoff * 2, 30.0)
             finally:
                 self._ws = None

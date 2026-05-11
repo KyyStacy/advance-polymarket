@@ -260,7 +260,7 @@ class TradingBot:
                     f"[bot] PRE-RESOLUTION SELL failed ({sell.error}) "
                     f"— position settles on-chain via Polymarket"
                 )
-                self.positions.open.pop(leftover.token_id, None)
+                self.positions.pop_open(leftover.token_id)
         else:
             # No liquid exit — position goes to on-chain resolution
             self.log.info(
@@ -581,12 +581,13 @@ class TradingBot:
             except Exception as e:
                 self.log.exception(f"[bot] tick error: {e}")
             # Event-driven trigger: re-evaluate immediately on any WS book update,
-            # otherwise wake every 100ms as a watchdog (window rollover, oracle
-            # ticks, etc.). Coalesce multiple WS updates into one tick by clearing
-            # before the wait — bursts collapse to a single re-evaluation.
+            # otherwise wake every 100ms while actively trading (window
+            # rollover, oracle ticks) or 1s when idle (saves CPU without
+            # affecting signal latency — no open position to act on anyway).
             self._tick_event.clear()
+            watchdog = 0.1 if self.positions.open else 1.0
             try:
-                await asyncio.wait_for(self._tick_event.wait(), timeout=0.1)
+                await asyncio.wait_for(self._tick_event.wait(), timeout=watchdog)
             except asyncio.TimeoutError:
                 pass
 
@@ -781,9 +782,10 @@ class TradingBot:
                 ]
 
                 # Open position section
-                if self.positions.open:
+                _open_snapshot = self.positions.snapshot_open()
+                if _open_snapshot:
                     table.append(f" {B}📍 ACTIVE POSITION{X}" + CLR)
-                    for pos in self.positions.open.values():
+                    for pos in _open_snapshot:
                         mark = self._bid_for(pos.token_id) or pos.entry_price
                         unreal = (mark - pos.entry_price) * pos.size_shares
                         unreal_pct = (unreal / (pos.cost_usd or 0.01)) * 100 if pos.cost_usd else 0

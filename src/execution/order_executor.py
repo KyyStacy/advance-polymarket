@@ -21,9 +21,13 @@ _ORDER_FAIL_COOLDOWN_SEC = 5.0
 # response-parsed estimates that may mask the true fill price.
 _FILL_POLL_DEADLINE_SEC = 10.0
 _FILL_POLL_INTERVAL_SEC = 0.25
-# Fast polling for first 2s: catches quick EOA fills without flooding later
-_FILL_POLL_FAST_SEC = 0.10
+# Fast polling: Gnosis Safe relay can land a fill in 200–600ms, so the first
+# checks should be aggressive. Tighter initial poll (50ms) + exponential
+# backoff catches quick fills 50–100ms faster than the previous flat 100ms.
+_FILL_POLL_FAST_SEC = 0.05
 _FILL_POLL_FAST_WINDOW_SEC = 2.0
+_FILL_POLL_BACKOFF_MULT = 1.5
+_FILL_POLL_MAX_SEC = 0.25
 # Minimum balance change considered a real fill (filters out dust noise)
 _BALANCE_DELTA_EPSILON = 0.005
 # Max ask drift (absolute USD) validated in main.py before calling buy_to_open.
@@ -51,7 +55,9 @@ _SELL_RETRY_DELAY_SEC = 0.020  # 20 ms — let book briefly re-quote between att
 # retry hits the same empty book and kills too. Better to give up fast and let
 # exit_engine fire again ~50ms later with a fresh mark_price (and possibly fresh
 # book depth). Total sell budget: ~3s worst-case vs 12s previously.
-_SELL_API_TIMEOUT_SEC = 1.5  # tighter — sells give up faster
+# Polymarket POST P50 ~150–250ms, P99 ~500ms. Cutting from 1.5s → 0.6s
+# saves up to ~1s per dead attempt while keeping a 2× safety margin over P99.
+_SELL_API_TIMEOUT_SEC = 0.6
 # Sell reconciliation deadline. Kept at 20s as a conservative cap covering
 # slow-relayer settlement on POLY_1271 deposit wallets. If actual settlement
 # proves consistently faster (1–4s typical), this can be tightened later.
@@ -167,6 +173,10 @@ class OrderExecutor:
         # Subsequent sells do a quick 2s check instead of full 20s poll to avoid
         # blocking the main tick loop on every retry.
         self._slow_settlement_tokens: set[str] = set()
+        # Tokens whose sell reconcile is still in flight. Buy guard blocks re-entry
+        # while a token is here — prevents the post-sell guard (5s) from expiring
+        # before reconcile (20s) finishes and possibly re-opens the position.
+        self._reconciling_sell: set[str] = set()
         # Order outcome counters (in-memory only, logged periodically).
         self._counters: dict[str, int] = {
             "buy_filled": 0,
@@ -247,7 +257,7 @@ class OrderExecutor:
         them as suspicious.
         """
         deadline = time.monotonic() + _FILL_POLL_DEADLINE_SEC
-        fast_until = time.monotonic() + _FILL_POLL_FAST_WINDOW_SEC
+        interval = _FILL_POLL_FAST_SEC
         while time.monotonic() < deadline:
             cur_token = await self.clob.get_token_balance(token_id)
             if (
@@ -262,8 +272,8 @@ class OrderExecutor:
                     cost = fallback_cost
                 avg = cost / size if size > 0 else fallback_cost / max(fallback_size, 1e-6)
                 return size, cost, avg, True
-            interval = _FILL_POLL_FAST_SEC if time.monotonic() < fast_until else _FILL_POLL_INTERVAL_SEC
             await asyncio.sleep(interval)
+            interval = min(interval * _FILL_POLL_BACKOFF_MULT, _FILL_POLL_MAX_SEC)
         # Final read — sometimes the delta lands right after the deadline
         cur_token = await self.clob.get_token_balance(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
@@ -306,7 +316,7 @@ class OrderExecutor:
         which would produce a spurious fill_avg of 0.
         """
         deadline = time.monotonic() + _SELL_FILL_POLL_DEADLINE_SEC
-        fast_until = time.monotonic() + _FILL_POLL_FAST_WINDOW_SEC
+        interval = _FILL_POLL_FAST_SEC
         while time.monotonic() < deadline:
             cur_token = await self.clob.get_token_balance(token_id)
             if (
@@ -323,8 +333,8 @@ class OrderExecutor:
                     if actual_sold > 0:
                         return proceeds / actual_sold, proceeds, True
                 # else: token dropped but USDC pending — keep polling
-            interval = _FILL_POLL_FAST_SEC if time.monotonic() < fast_until else _FILL_POLL_INTERVAL_SEC
             await asyncio.sleep(interval)
+            interval = min(interval * _FILL_POLL_BACKOFF_MULT, _FILL_POLL_MAX_SEC)
         # Final read — sometimes both deltas land right after the deadline
         cur_token = await self.clob.get_token_balance(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
@@ -473,6 +483,8 @@ class OrderExecutor:
                 )
         except Exception as e:
             log.error(f"[exec] _bg_reconcile_sell error for {token_id[:8]}: {e}")
+        finally:
+            self._reconciling_sell.discard(token_id)
 
     async def _wait_for_token_balance(
         self,
@@ -563,6 +575,18 @@ class OrderExecutor:
                 f"(Gnosis Safe guard: wait {_POST_SELL_GUARD_SEC:.0f}s)"
             )
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="post-sell-cooldown")
+
+        # Block re-buy while a previous sell's reconcile is still in flight.
+        # The post-sell guard above (5s) is shorter than the reconcile deadline
+        # (20s); without this check, the reconcile could time out and re-open
+        # the OLD position while a NEW position is also open → double-position
+        # corruption (see Bug 1 / Bug 2 in project memory).
+        if token_id in self._reconciling_sell:
+            log.warning(
+                f"[exec] buy skipped — sell reconcile still in flight for "
+                f"{token_id[:8]}… (would risk double-position on timeout)"
+            )
+            return FillReport(False, 0.0, 0.0, 0.0, {}, error="sell-reconciling")
 
         # Token balance pre-check.
         # Hot-path optimisation: skip the ~100ms HTTP fetch when we KNOW the
@@ -837,7 +861,7 @@ class OrderExecutor:
                 f"{mark_price:.3f} = ${sold_shares * mark_price:.4f} < "
                 f"${_MIN_SELL_USD} minimum — clearing ghost position"
             )
-            self.positions.open.pop(token_id, None)
+            self.positions.pop_open(token_id)
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="too-small-to-sell")
 
         # Retry loop on FAK kills — same rationale as buy: the book sometimes
@@ -892,10 +916,18 @@ class OrderExecutor:
                     if "sum of matched orders" in last_err:
                         log.warning(
                             f"[exec] sell: existing order consuming all tokens "
-                            f"— waiting 3s to check outcome..."
+                            f"— polling up to 1.5s for confirmation..."
                         )
-                        await asyncio.sleep(3.0)
-                        cur_bal = await self.clob.get_token_balance(token_id)
+                        # Poll-don't-sleep: bail out as soon as balance clears so
+                        # the main loop isn't frozen for the full 1.5s. The previous
+                        # 3.0s sleep blocked ~60 strategy ticks for no reason.
+                        cur_bal = None
+                        _phantom_deadline = time.monotonic() + 1.5
+                        while time.monotonic() < _phantom_deadline:
+                            await asyncio.sleep(0.15)
+                            cur_bal = await self.clob.get_token_balance(token_id)
+                            if cur_bal is None or cur_bal < sold_shares * 0.50:
+                                break
                         # Sell confirmed if: (a) no tokens remain, OR (b) only dust remains.
                         # Dust (e.g. 0.0086sh << 1.43sh) = old residual from prior sessions;
                         # the current batch was cleared by the matched sell order.
@@ -954,9 +986,15 @@ class OrderExecutor:
                             return FillReport(False, 0.0, 0.0, 0.0, {}, error="settlement-dust")
                         self._slow_settlement_tokens.add(token_id)
                         log.warning(f"[exec] balance still 0 after {poll_sec:.0f}s — buy may have failed")
-                    # Already waited or balance still 0 → check if phantom sell happened
-                    await asyncio.sleep(1.0)
-                    cur_bal = await self.clob.get_token_balance(token_id)
+                    # Already waited or balance still 0 → check if phantom sell happened.
+                    # Short poll loop (max 300ms) instead of 1.0s blocking sleep.
+                    cur_bal = None
+                    _phantom2_deadline = time.monotonic() + 0.3
+                    while time.monotonic() < _phantom2_deadline:
+                        await asyncio.sleep(0.1)
+                        cur_bal = await self.clob.get_token_balance(token_id)
+                        if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
+                            break
                     if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
                         log.warning(
                             "[exec] balance=0 and buy not settling — "
@@ -1061,6 +1099,7 @@ class OrderExecutor:
             # Background verify: warn if on-chain data contradicts response.
             # Passes pos_side/pos_window_ts so the task can re-open the position
             # if on-chain confirmation times out (Gnosis Safe relay dropped the tx).
+            self._reconciling_sell.add(token_id)
             asyncio.ensure_future(
                 self._bg_reconcile_sell(
                     token_id, actual_bal, pre_pusd, sold_shares, fill_avg,

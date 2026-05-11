@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -27,6 +28,10 @@ class RiskManager:
     _start_balance: float = 0.0          # balance when bot first started
     _daily_start_balance: float = 0.0     # balance at WIB midnight (or first read)
     _last_day_key: str = ""              # for midnight detection
+
+    # Protects compound mutations (record_trade_pnl, can_trade, day-reset).
+    # bg_reconcile tasks can update pnl while main loop reads it.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @staticmethod
     def _today_key() -> str:
@@ -69,30 +74,38 @@ class RiskManager:
 
     def maybe_reset_daily(self, usd: float) -> None:
         """Auto-detect WIB day change and reset daily baseline."""
-        today = self._today_key()
-        if today != self._last_day_key:
-            self._last_day_key = today
-            self.reset_daily_balance(usd)
-            # Also clear trade-based daily tracker so it stays consistent
-            self.pnl = DailyPnl(day_key=today)
+        with self._lock:
+            today = self._today_key()
+            if today != self._last_day_key:
+                self._last_day_key = today
+                self._daily_start_balance = max(0.0, float(usd))
+                self.pnl = DailyPnl(day_key=today)
+                log.info(f"[risk] daily balance reset: ${self._daily_start_balance:.2f}")
 
     def update_bankroll(self, usd: float) -> None:
-        self.bankroll_usd = max(0.0, float(usd))
+        with self._lock:
+            self.bankroll_usd = max(0.0, float(usd))
 
     def record_trade_pnl(self, pnl: float) -> None:
-        self._ensure_day()
-        self.pnl.realized += pnl
-        self.pnl.n_trades += 1
-        self.total_pnl += pnl
+        with self._lock:
+            today = self._today_key()
+            if self.pnl.day_key != today:
+                self.pnl = DailyPnl(day_key=today)
+            self.pnl.realized += pnl
+            self.pnl.n_trades += 1
+            self.total_pnl += pnl
 
     def can_trade(self) -> tuple[bool, str]:
-        self._ensure_day()
-        if self.pnl.realized <= -abs(self.settings.max_daily_loss_usd):
-            return False, (
-                f"daily-loss-cap hit ({self.pnl.realized:.2f} <= "
-                f"-{self.settings.max_daily_loss_usd:.2f})"
-            )
-        return True, "ok"
+        with self._lock:
+            today = self._today_key()
+            if self.pnl.day_key != today:
+                self.pnl = DailyPnl(day_key=today)
+            if self.pnl.realized <= -abs(self.settings.max_daily_loss_usd):
+                return False, (
+                    f"daily-loss-cap hit ({self.pnl.realized:.2f} <= "
+                    f"-{self.settings.max_daily_loss_usd:.2f})"
+                )
+            return True, "ok"
 
     def position_size_usd(self, edge: float, implied_p: float, win_prob: float = 0.5) -> float:
         """Choose USD size given edge, odds, and win probability.

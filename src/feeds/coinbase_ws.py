@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from typing import Callable
 
@@ -82,6 +83,7 @@ class CoinbaseFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning(f"[coinbase] disconnect: {e}; retry in {backoff:.1f}s")
-                await asyncio.sleep(backoff)
+                wait = max(0.2, backoff + random.uniform(0.0, 0.5))
+                log.warning(f"[coinbase] disconnect: {e}; retry in {wait:.2f}s")
+                await asyncio.sleep(wait)
                 backoff = min(backoff * 2, 30.0)
