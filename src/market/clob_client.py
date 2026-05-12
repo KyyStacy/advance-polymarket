@@ -229,15 +229,52 @@ class PolymarketClobClient:
         # Initialize Rust HFT pool if available
         if _HAS_RUST_HFT:
             try:
+                # Extract the signing context from the builder
+                _b = c.builder
+                _chain_id = str(_b.signer.get_chain_id())
+                _pk = _b.signer.private_key
+                if hasattr(_pk, "hex"):
+                    _pk = "0x" + _pk.hex()
+                elif isinstance(_pk, bytes):
+                    _pk = "0x" + _pk.hex()
+                else:
+                    _pk = str(_pk)
+                
+                from py_clob_client_v2.config import get_contract_config
+                from py_clob_client_v2.order_utils.exchange_order_builder_v2 import (
+                    ExchangeOrderBuilderV2, ORDER_TYPE_HASH, SOLADY_TYPE_HASH,
+                    DEPOSIT_WALLET_NAME_HASH, DEPOSIT_WALLET_VERSION_HASH,
+                    DEPOSIT_WALLET_DOMAIN_SALT, ORDER_TYPE_STRING
+                )
+
+                _cfg = get_contract_config(int(_chain_id))
+                _ex_ctf = ExchangeOrderBuilderV2(_cfg.exchange_v2, int(_chain_id), _b.signer)
+                _ex_neg = ExchangeOrderBuilderV2(_cfg.neg_risk_exchange_v2, int(_chain_id), _b.signer)
+                
+                _c_type = ORDER_TYPE_STRING.encode("utf-8").hex()
+                _c_len = len(ORDER_TYPE_STRING).to_bytes(2, "big").hex()
+
                 self._rust_creds = polymarket_hft.RustApiCreds(
                     self.s.clob_api_key,
                     self.s.clob_secret,
                     self.s.clob_passphrase,
+                    _chain_id,
+                    _pk,
+                    _ex_ctf.app_domain_separator.hex(),
+                    _ex_neg.app_domain_separator.hex(),
+                    ORDER_TYPE_HASH.hex(),
+                    SOLADY_TYPE_HASH.hex(),
+                    DEPOSIT_WALLET_NAME_HASH.hex(),
+                    DEPOSIT_WALLET_VERSION_HASH.hex(),
+                    DEPOSIT_WALLET_DOMAIN_SALT.hex(),
+                    _c_type + _c_len
                 )
                 self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host, 1100)
                 log.info(f"[clob] Rust HTTP/2 pool active ({self._rust_pool})")
             except Exception as e:
                 log.error(f"[clob] Failed to init Rust HFT path: {e}")
+                import traceback
+                log.error(traceback.format_exc())
                 self._rust_pool = None
                 self._rust_creds = None
 
@@ -382,20 +419,21 @@ class PolymarketClobClient:
         )
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
-        # Pre-sign: signing (~3-5ms with eth_account C-ext) is done BEFORE the
-        # caller's wait_for() timeout fires for the POST, freeing the full
-        # api_timeout budget for the actual network round-trip.
-        # NOTE: `time` is imported at module level — no per-call sys.modules lookup.
-        _t_sign = time.monotonic()
-        signed = await asyncio.to_thread(
-            self.client.create_market_order, order_args=args, options=options
-        )
-        sign_ms = (time.monotonic() - _t_sign) * 1000
+        # Pre-sign: only used if Rust is unavailable.
+        # If Rust is available, signing is done inside the FFI call.
+        if not self._rust_pool:
+            _t_sign = time.monotonic()
+            signed = await asyncio.to_thread(
+                self.client.create_market_order, order_args=args, options=options
+            )
+            sign_ms = (time.monotonic() - _t_sign) * 1000
+        else:
+            signed = None
+            sign_ms = 0.0
+
         if cancel_flag is not None and cancel_flag.is_set():
             raise RuntimeError("buy cancelled before POST (timeout)")
 
-        # Cache locals once to avoid repeated attribute lookups inside the
-        # thread callback (each `self.xxx` is a hash-table lookup).
         _client = self.client
         _poly_addr = self._poly_addr
         _api_key = self._clob_api_key
@@ -404,25 +442,41 @@ class PolymarketClobClient:
         _rust_creds = self._rust_creds
 
         def _post() -> Any:
-            # Diagnostic log is behind _debug guard: f-string construction is
-            # skipped entirely at INFO level, saving ~0.1–0.5 ms per order.
-            if _debug:
-                log.debug(
-                    f"[clob.diag] BUY post sig=3 funder={_poly_addr[:10]} "
-                    f"signed.signer={getattr(signed, 'signer', '?')[:10]} "
-                    f"signed.maker={getattr(signed, 'maker', '?')[:10]} "
-                    f"signed.builder={str(getattr(signed, 'builder', BYTES32_ZERO))[:10]} "
-                    f"api_key={_api_key[:8]} "
-                    f"neg_risk={neg_risk} tick={tick_size} sign_ms={sign_ms:.1f}"
-                )
             if _rust_pool and _rust_creds:
                 import orjson
-                payload = order_to_json_v2(signed, _api_key, order_type, False, False)
-                body_str = orjson.dumps(payload).decode("utf-8")
-                # Releases GIL during network I/O
-                resp_str = _rust_pool.post_order(body_str, _rust_creds)
+                from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+                
+                # Math prep in Python (extremely fast ~0.05ms)
+                rc = ROUNDING_CONFIG[tick_size]
+                _, m_amt, t_amt = _client.builder.get_market_order_amounts(BUY, usd_amount, worst_price, rc)
+                
+                # FFI Call: Generation, Keccak256 Hashing, k256 ECDSA, JSON, HTTP/2 POST
+                _t_ffi = time.monotonic()
+                resp_str = _rust_pool.sign_and_post_order(
+                    _rust_creds,
+                    _client.builder.funder,
+                    _client.builder._v2_order_signer(),
+                    token_id,
+                    str(m_amt),
+                    str(t_amt),
+                    0,  # BUY side
+                    neg_risk
+                )
+                sign_ms = (time.monotonic() - _t_ffi) * 1000  # approximates the entire blocking call
+                
+                if _debug:
+                    log.debug(
+                        f"[clob.diag] BUY HFT post funder={_poly_addr[:10]} "
+                        f"api_key={_api_key[:8]} neg_risk={neg_risk} ffi_ms={sign_ms:.1f}"
+                    )
                 return orjson.loads(resp_str)
             else:
+                if _debug:
+                    log.debug(
+                        f"[clob.diag] BUY post sig=3 funder={_poly_addr[:10]} "
+                        f"signed.signer={getattr(signed, 'signer', '?')[:10]} "
+                        f"api_key={_api_key[:8]} neg_risk={neg_risk} sign_ms={sign_ms:.1f}"
+                    )
                 return _client.post_order(signed, order_type)
 
         _t_post = time.monotonic()
@@ -527,6 +581,7 @@ class PolymarketClobClient:
                 )
             if _rust_pool and _rust_creds:
                 import orjson
+                from py_clob_client_v2.client import order_to_json_v2
                 payload = order_to_json_v2(signed, _api_key, OrderType.FAK, False, False)
                 body_str = orjson.dumps(payload).decode("utf-8")
                 resp_str = _rust_pool.post_order(body_str, _rust_creds)

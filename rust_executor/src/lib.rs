@@ -1,28 +1,6 @@
-/// lib.rs — PyO3 module entry point for `polymarket_hft`.
-///
-/// Exposes two Python classes and one helper function:
-///
-///   `RustApiCreds(api_key, api_secret, api_passphrase)`
-///     — Pre-decoded credentials (constructed once at startup, reused per order).
-///
-///   `RustHttpPool(clob_host, timeout_ms=1100)`
-///     — Persistent HTTP/2 connection pool.  Call `.warm_up()` at startup.
-///
-///   `RustHttpPool.post_order(order_json_str, creds) -> str`
-///     — Blocking (GIL-releasing) POST.  Returns raw response JSON string.
-///       Called via `asyncio.to_thread()` in Python so the event loop stays live.
-///
-/// Design rationale:
-///   Python asyncio continues to own scheduling; Rust owns the fast I/O path.
-///   We release the GIL with `py.allow_threads(|| {...})` so other asyncio
-///   callbacks can proceed while we wait for the HTTP response.
-///
-///   A single shared `tokio::runtime::Runtime` is lazily initialised in
-///   `TOKIO_RT` and reused across all calls — avoids spawning a new thread
-///   pool per request.
-
 mod auth;
 mod http_pool;
+mod signer;
 
 use auth::ApiCreds;
 use http_pool::HttpPool;
@@ -31,62 +9,78 @@ use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-/// Shared Tokio runtime — built once, used by every `post_order` call.
+/// Shared Tokio runtime
 static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)       // 2 threads: one for active order, one for warmup/reconnect
+        .worker_threads(2)
         .thread_name("poly-hft")
         .enable_all()
         .build()
         .expect("failed to build Tokio runtime")
 });
 
-// ---------------------------------------------------------------------------
-// Python class: RustApiCreds
-// ---------------------------------------------------------------------------
-
-/// Pre-decoded Polymarket CLOB API credentials.
-///
-/// Construct once per bot session:
-///   ```python
-///   creds = polymarket_hft.RustApiCreds(api_key, api_secret, api_passphrase)
-///   ```
-/// Pass the same object to every `post_order()` call — no re-decoding overhead.
 #[pyclass]
 struct RustApiCreds {
     inner: ApiCreds,
+    // Signing context pre-computed by Python
+    #[pyo3(get)]
+    chain_id: String,
+    #[pyo3(get)]
+    private_key: String,
+    #[pyo3(get)]
+    app_domain_ctf: String,
+    #[pyo3(get)]
+    app_domain_neg_risk: String,
+    #[pyo3(get)]
+    order_type_hash: String,
+    #[pyo3(get)]
+    solady_type_hash: String,
+    #[pyo3(get)]
+    wallet_name_hash: String,
+    #[pyo3(get)]
+    wallet_version_hash: String,
+    #[pyo3(get)]
+    wallet_salt: String,
+    #[pyo3(get)]
+    contents_type_suffix: String,
 }
 
 #[pymethods]
 impl RustApiCreds {
     #[new]
-    fn new(api_key: &str, api_secret: &str, api_passphrase: &str) -> Self {
+    #[pyo3(signature = (api_key, api_secret, api_passphrase, chain_id, private_key, app_domain_ctf, app_domain_neg_risk, order_type_hash, solady_type_hash, wallet_name_hash, wallet_version_hash, wallet_salt, contents_type_suffix))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        api_key: &str,
+        api_secret: &str,
+        api_passphrase: &str,
+        chain_id: &str,
+        private_key: &str,
+        app_domain_ctf: &str,
+        app_domain_neg_risk: &str,
+        order_type_hash: &str,
+        solady_type_hash: &str,
+        wallet_name_hash: &str,
+        wallet_version_hash: &str,
+        wallet_salt: &str,
+        contents_type_suffix: &str,
+    ) -> Self {
         RustApiCreds {
             inner: ApiCreds::new(api_key, api_secret, api_passphrase),
+            chain_id: chain_id.to_string(),
+            private_key: private_key.to_string(),
+            app_domain_ctf: app_domain_ctf.to_string(),
+            app_domain_neg_risk: app_domain_neg_risk.to_string(),
+            order_type_hash: order_type_hash.to_string(),
+            solady_type_hash: solady_type_hash.to_string(),
+            wallet_name_hash: wallet_name_hash.to_string(),
+            wallet_version_hash: wallet_version_hash.to_string(),
+            wallet_salt: wallet_salt.to_string(),
+            contents_type_suffix: contents_type_suffix.to_string(),
         }
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "RustApiCreds(api_key={}...)",
-            &self.inner.api_key[..8.min(self.inner.api_key.len())]
-        )
     }
 }
 
-// ---------------------------------------------------------------------------
-// Python class: RustHttpPool
-// ---------------------------------------------------------------------------
-
-/// Persistent HTTP/2 connection pool for clob.polymarket.com.
-///
-/// Usage:
-///   ```python
-///   pool = polymarket_hft.RustHttpPool("https://clob.polymarket.com", timeout_ms=1100)
-///   await asyncio.to_thread(pool.warm_up)          # pre-warm TLS on startup
-///   # ... later in hot path:
-///   resp_json = await asyncio.to_thread(pool.post_order, order_json, creds)
-///   ```
 #[pyclass]
 struct RustHttpPool {
     pool: Arc<HttpPool>,
@@ -107,10 +101,6 @@ impl RustHttpPool {
         })
     }
 
-    /// Pre-warm the TLS connection (blocking, call once via asyncio.to_thread).
-    ///
-    /// After this returns, the first real order avoids the TLS handshake
-    /// latency (~80–200 ms on cold start).
     fn warm_up(&self, py: Python<'_>) {
         let pool = Arc::clone(&self.pool);
         py.allow_threads(|| {
@@ -118,22 +108,65 @@ impl RustHttpPool {
         });
     }
 
-    /// POST a signed order to Polymarket CLOB.
-    ///
-    /// # Arguments
-    /// * `order_json` — full JSON body string (pre-serialized by Python caller).
-    /// * `creds`      — `RustApiCreds` instance.
-    ///
-    /// # Returns
-    /// Raw response body as a Python `str` (JSON).  The Python caller is
-    /// responsible for `json.loads()` / `orjson.loads()`.
-    ///
-    /// # GIL behaviour
-    /// Releases the GIL during the entire HTTP round-trip so the asyncio
-    /// event loop can process other callbacks (feed ticks, WS messages) while
-    /// we wait for the network.  This is the key latency win vs the old
-    /// `asyncio.to_thread(post_order)` approach where GIL contention
-    /// occasionally delayed the thread start by ~0.5–1 ms.
+    /// Complete HFT flow: Sign EIP-1271 order and POST in Rust
+    #[allow(clippy::too_many_arguments)]
+    fn sign_and_post_order(
+        &self,
+        py: Python<'_>,
+        creds: &RustApiCreds,
+        maker: &str,
+        signer: &str,
+        token_id: &str,
+        maker_amount: &str,
+        taker_amount: &str,
+        side: u8,
+        neg_risk: bool,
+    ) -> PyResult<String> {
+        let pool = Arc::clone(&self.pool);
+        let inner_creds = creds.inner.clone();
+
+        // Pass signing context
+        let chain_id = creds.chain_id.clone();
+        let pk = creds.private_key.clone();
+        let app_domain = if neg_risk { creds.app_domain_neg_risk.clone() } else { creds.app_domain_ctf.clone() };
+        let type_hash = creds.order_type_hash.clone();
+        let solady_hash = creds.solady_type_hash.clone();
+        let w_name = creds.wallet_name_hash.clone();
+        let w_version = creds.wallet_version_hash.clone();
+        let w_salt = creds.wallet_salt.clone();
+        let contents_suffix = creds.contents_type_suffix.clone();
+
+        let maker = maker.to_string();
+        let signer = signer.to_string();
+        let token_id = token_id.to_string();
+        let maker_amount = maker_amount.to_string();
+        let taker_amount = taker_amount.to_string();
+
+        let result = py.allow_threads(move || {
+            // 1. Generate Order & Sign
+            let (order_json, _signature) = signer::build_and_sign_order(
+                &chain_id, &pk, &app_domain, &type_hash, &solady_hash,
+                &w_name, &w_version, &w_salt, &contents_suffix,
+                &maker, &signer, &token_id, &maker_amount, &taker_amount, side
+            );
+            
+            // 2. Format final payload
+            // py_clob_client_v2 formats to: {"order": {salt, maker, ...}, "owner": api_key, "orderType": "FAK"}
+            let payload = format!(r#"{{"order":{},"owner":"{}","orderType":"FAK"}}"#, order_json, inner_creds.api_key);
+
+            // 3. POST
+            TOKIO_RT.block_on(async move { pool.post_order_json(&payload, &inner_creds).await })
+        });
+
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "RustHttpPool error: {e}"
+            ))),
+        }
+    }
+
+    /// POST a pre-signed JSON order (used for sell orders that rely on orderbook fetching)
     fn post_order(
         &self,
         py: Python<'_>,
@@ -155,15 +188,7 @@ impl RustHttpPool {
             ))),
         }
     }
-
-    fn __repr__(&self) -> &'static str {
-        "RustHttpPool(http2=on, rustls=on)"
-    }
 }
-
-// ---------------------------------------------------------------------------
-// Module registration
-// ---------------------------------------------------------------------------
 
 #[pymodule]
 fn polymarket_hft(m: &Bound<'_, PyModule>) -> PyResult<()> {
