@@ -18,7 +18,8 @@ try:
         dummy_hex,      # wallet_name_hash
         dummy_hex,      # wallet_version_hash
         dummy_hex,      # wallet_salt
-        "00" * 32       # contents_type_suffix
+        "00" * 32,      # contents_type_suffix
+        "0x" + "0" * 40 # signer_address
     )
     pool = polymarket_hft.RustHttpPool("https://clob.polymarket.com", 1100)
     

@@ -43,12 +43,14 @@ struct RustApiCreds {
     wallet_salt: String,
     #[pyo3(get)]
     contents_type_suffix: String,
+    #[pyo3(get)]
+    signer_address: String,
 }
 
 #[pymethods]
 impl RustApiCreds {
     #[new]
-    #[pyo3(signature = (api_key, api_secret, api_passphrase, chain_id, private_key, app_domain_ctf, app_domain_neg_risk, order_type_hash, solady_type_hash, wallet_name_hash, wallet_version_hash, wallet_salt, contents_type_suffix))]
+    #[pyo3(signature = (api_key, api_secret, api_passphrase, chain_id, private_key, app_domain_ctf, app_domain_neg_risk, order_type_hash, solady_type_hash, wallet_name_hash, wallet_version_hash, wallet_salt, contents_type_suffix, signer_address))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         api_key: &str,
@@ -64,6 +66,7 @@ impl RustApiCreds {
         wallet_version_hash: &str,
         wallet_salt: &str,
         contents_type_suffix: &str,
+        signer_address: &str,
     ) -> Self {
         RustApiCreds {
             inner: ApiCreds::new(api_key, api_secret, api_passphrase),
@@ -77,6 +80,7 @@ impl RustApiCreds {
             wallet_version_hash: wallet_version_hash.to_string(),
             wallet_salt: wallet_salt.to_string(),
             contents_type_suffix: contents_type_suffix.to_string(),
+            signer_address: signer_address.to_string(),
         }
     }
 }
@@ -150,12 +154,15 @@ impl RustHttpPool {
                 &maker, &signer, &token_id, &maker_amount, &taker_amount, side
             );
             
-            // 2. Format final payload
-            // py_clob_client_v2 formats to: {"order": {salt, maker, ...}, "owner": api_key, "orderType": "FAK"}
-            let payload = format!(r#"{{"order":{},"owner":"{}","orderType":"FAK"}}"#, order_json, inner_creds.api_key);
+            // 2. Format final payload - must include deferExec+postOnly like order_to_json_v2()
+            let payload = format!(
+                r#"{{"order":{},"owner":"{}","orderType":"FAK","deferExec":false,"postOnly":false}}"#,
+                order_json, inner_creds.api_key
+            );
+            let hmac_signer = creds.signer_address.clone();
 
             // 3. POST
-            TOKIO_RT.block_on(async move { pool.post_order_json(&payload, &inner_creds).await })
+            TOKIO_RT.block_on(async move { pool.post_order_json(&payload, &inner_creds, &hmac_signer).await })
         });
 
         match result {
@@ -164,6 +171,48 @@ impl RustHttpPool {
                 "RustHttpPool error: {e}"
             ))),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn debug_payload(
+        &self,
+        _py: Python<'_>,
+        creds: &RustApiCreds,
+        maker: &str,
+        signer: &str,
+        token_id: &str,
+        maker_amount: &str,
+        taker_amount: &str,
+        side: u8,
+        neg_risk: bool,
+    ) -> PyResult<String> {
+        let inner_creds = creds.inner.clone();
+        let chain_id = creds.chain_id.clone();
+        let pk = creds.private_key.clone();
+        let app_domain = if neg_risk { creds.app_domain_neg_risk.clone() } else { creds.app_domain_ctf.clone() };
+        let type_hash = creds.order_type_hash.clone();
+        let solady_hash = creds.solady_type_hash.clone();
+        let w_name = creds.wallet_name_hash.clone();
+        let w_version = creds.wallet_version_hash.clone();
+        let w_salt = creds.wallet_salt.clone();
+        let contents_suffix = creds.contents_type_suffix.clone();
+
+        let maker = maker.to_string();
+        let signer = signer.to_string();
+        let token_id = token_id.to_string();
+        let maker_amount = maker_amount.to_string();
+        let taker_amount = taker_amount.to_string();
+
+        let (order_json, _sig) = signer::build_and_sign_order(
+            &chain_id, &pk, &app_domain, &type_hash, &solady_hash,
+            &w_name, &w_version, &w_salt, &contents_suffix,
+            &maker, &signer, &token_id, &maker_amount, &taker_amount, side
+        );
+        let payload = format!(
+            r#"{{"order":{},"owner":"{}","orderType":"FAK","deferExec":false,"postOnly":false}}"#,
+            order_json, inner_creds.api_key
+        );
+        Ok(payload)
     }
 
     /// POST a pre-signed JSON order (used for sell orders that rely on orderbook fetching)
@@ -176,9 +225,10 @@ impl RustHttpPool {
         let pool = Arc::clone(&self.pool);
         let creds_inner = creds.inner.clone();
         let body = order_json.to_owned();
+        let signer_addr = creds.signer_address.clone();
 
         let result = py.allow_threads(move || {
-            TOKIO_RT.block_on(async move { pool.post_order_json(&body, &creds_inner).await })
+            TOKIO_RT.block_on(async move { pool.post_order_json(&body, &creds_inner, &signer_addr).await })
         });
 
         match result {

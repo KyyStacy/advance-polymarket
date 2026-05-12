@@ -760,9 +760,9 @@ class OrderExecutor:
                 )
             return FillReport(False, 0.0, 0.0, 0.0, {}, error=f"fak-killed:{last_err}")
 
-        ok = bool(resp.get("success", True)) and not resp.get("errorMsg")
+        ok = bool(resp.get("success", True)) and not resp.get("errorMsg") and not resp.get("message") and not resp.get("error")
         if not ok:
-            err_msg = str(resp.get("errorMsg") or resp.get("error") or "")
+            err_msg = str(resp.get("errorMsg") or resp.get("error") or resp.get("message") or "")
             if self._is_fak_kill(err_msg):
                 self._counters["buy_fak_killed"] += 1
                 log.info("[exec] BUY killed (FAK no match) — book empty below worst_price")
@@ -1032,11 +1032,11 @@ class OrderExecutor:
                 log.warning(f"[exec] sell_to_close failed: {last_err}")
                 return FillReport(False, 0.0, 0.0, 0.0, {}, error=last_err)
 
-            ok = bool(resp.get("success", True)) and not resp.get("errorMsg")
+            ok = bool(resp.get("success", True)) and not resp.get("errorMsg") and not resp.get("message") and not resp.get("error")
             if ok:
                 break
 
-            err_msg = str(resp.get("errorMsg") or resp.get("error") or "")
+            err_msg = str(resp.get("errorMsg") or resp.get("error") or resp.get("message") or "")
             last_err = err_msg
             is_fak = self._is_fak_kill(err_msg)
             if is_fak and attempt < _SELL_MAX_ATTEMPTS:

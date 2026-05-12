@@ -1,9 +1,9 @@
-/// http_pool.rs — Persistent HTTP/2 connection pool for Polymarket CLOB.
+/// http_pool.rs - Persistent HTTP/2 connection pool for Polymarket CLOB.
 ///
 /// Uses `reqwest::Client` which internally maintains a connection pool
 /// (up to `pool_max_idle_per_host` idle connections, HTTP/2 multiplexing).
-/// The client is created ONCE and reused across all orders — eliminates
-/// TLS handshake overhead on every subsequent request (~80–200 ms saved).
+/// The client is created ONCE and reused across all orders - eliminates
+/// TLS handshake overhead on every subsequent request (~80-200 ms saved).
 ///
 /// Architecture:
 ///   - `reqwest::Client` is `Arc`-wrapped and `Clone`-able (pool is shared).
@@ -41,7 +41,7 @@ impl HttpPool {
             .pool_idle_timeout(Duration::from_secs(90))
             // Per-request wall-clock timeout.
             .timeout(Duration::from_millis(timeout_ms))
-            // Use rustls (pure Rust TLS — no OpenSSL dependency on Windows).
+            // Use rustls (pure Rust TLS - no OpenSSL dependency on Windows).
             .use_rustls_tls()
             .build()?;
 
@@ -68,9 +68,10 @@ impl HttpPool {
         &self,
         order_body: &str,
         creds: &ApiCreds,
+        signer_address: &str,
     ) -> Result<String, reqwest::Error> {
         let path = "/order";
-        let auth = build_auth_headers(creds, path, order_body);
+        let auth = build_auth_headers(creds, signer_address, path, order_body);
 
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.client.post(&url).body(order_body.to_owned());

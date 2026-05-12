@@ -267,7 +267,8 @@ class PolymarketClobClient:
                     DEPOSIT_WALLET_NAME_HASH.hex(),
                     DEPOSIT_WALLET_VERSION_HASH.hex(),
                     DEPOSIT_WALLET_DOMAIN_SALT.hex(),
-                    _c_type + _c_len
+                    _c_type + _c_len,
+                    _b.signer.address()
                 )
                 self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host, 1100)
                 log.info(f"[clob] Rust HTTP/2 pool active ({self._rust_pool})")
@@ -464,11 +465,9 @@ class PolymarketClobClient:
                 )
                 sign_ms = (time.monotonic() - _t_ffi) * 1000  # approximates the entire blocking call
                 
-                if _debug:
-                    log.debug(
-                        f"[clob.diag] BUY HFT post funder={_poly_addr[:10]} "
-                        f"api_key={_api_key[:8]} neg_risk={neg_risk} ffi_ms={sign_ms:.1f}"
-                    )
+                # FORCE LOG FOR DEBUGGING
+                log.warning(f"[clob.diag] BUY HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
+                
                 return orjson.loads(resp_str)
             else:
                 if _debug:
@@ -585,6 +584,8 @@ class PolymarketClobClient:
                 payload = order_to_json_v2(signed, _api_key, OrderType.FAK, False, False)
                 body_str = orjson.dumps(payload).decode("utf-8")
                 resp_str = _rust_pool.post_order(body_str, _rust_creds)
+                # FORCE LOG FOR DEBUGGING
+                log.warning(f"[clob.diag] SELL HFT post resp={resp_str[:300]}")
                 return orjson.loads(resp_str)
             else:
                 return _client.post_order(signed, OrderType.FAK)

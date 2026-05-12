@@ -30,15 +30,21 @@ pub fn build_and_sign_order(
     taker_amount: &str,
     side: u8,
 ) -> (String, String) {
+    // Python SDK uses: str(int(random.random() * (time.time_ns() // 1_000_000)))
+    // This is much smaller than 256-bit random. Large salts might fail Polymarket's Go-side JSON parsing.
     let salt = {
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        U256::from_be_bytes(bytes)
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let rand_val = (rand::thread_rng().next_u64() % 1000) as u64;
+        U256::from(now_ms * 1000 + rand_val)
     };
+    
+    // Python SDK uses: str(time.time_ns() // 1_000_000) - milliseconds
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     
     let maker_addr = Address::from_str(maker).unwrap_or_default();
     let signer_addr = Address::from_str(signer).unwrap_or_default();
+    
+    // We use strings for JSON but U256 for hashing
     let t_id = U256::from_str(token_id).unwrap_or_default();
     let m_amt = U256::from_str(maker_amount).unwrap_or_default();
     let t_amt = U256::from_str(taker_amount).unwrap_or_default();
@@ -105,10 +111,41 @@ pub fn build_and_sign_order(
     // 5. Construct POLY_1271 Signature
     let final_signature = format!("0x{}{}{}{}", inner_sig, hex::encode(app_domain_bytes), hex::encode(contents_hash.as_slice()), contents_suffix);
 
-    // 6. Construct JSON
+    // 6. Construct JSON - must be bit-perfect with order_to_json_v2() in py_clob_client_v2.
+    // Field order and types must match exactly:
+    //   salt        -> integer (no quotes)
+    //   maker/signer -> checksummed address string
+    //   tokenId     -> string (quotes)
+    //   makerAmount/takerAmount -> string (quotes)
+    //   side        -> string "BUY" or "SELL"
+    //   expiration  -> string "0"
+    //   signatureType -> integer (no quotes)
+    //   timestamp   -> string (quotes, milliseconds)
+    //   metadata/builder -> 0x + 64 hex zeros
+    //   signature   -> 0x-prefixed hex
     let side_str = if side == 0 { "BUY" } else { "SELL" };
-    let order_json = format!(r#"{{"salt":{},"maker":"{}","signer":"{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","side":"{}","signatureType":{},"timestamp":"{}","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","signature":"{}"}}"#,
-        salt, maker_addr.to_string(), signer_addr.to_string(), t_id, m_amt, t_amt, side_str, signature_type, timestamp, final_signature
+    let maker_cs = maker_addr.to_checksum(None);
+    let signer_cs = signer_addr.to_checksum(None);
+    let order_json = format!(
+        concat!(
+            r#"{{"salt":{salt},"maker":"{maker}","signer":"{signer}","#,
+            r#""tokenId":"{token_id}","makerAmount":"{m_amt}","takerAmount":"{t_amt}","#,
+            r#""side":"{side}","expiration":"0","signatureType":{sig_type},"#,
+            r#""timestamp":"{ts}","#,
+            r#""metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""builder":"0x0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""signature":"{sig}"}}"#
+        ),
+        salt = salt,
+        maker = maker_cs,
+        signer = signer_cs,
+        token_id = t_id,
+        m_amt = m_amt,
+        t_amt = t_amt,
+        side = side_str,
+        sig_type = signature_type,
+        ts = timestamp,
+        sig = final_signature,
     );
 
     (order_json, final_signature)
