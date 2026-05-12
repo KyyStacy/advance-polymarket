@@ -106,8 +106,9 @@ pub fn build_and_sign_order(
     let final_signature = format!("0x{}{}{}{}", inner_sig, hex::encode(app_domain_bytes), hex::encode(contents_hash.as_slice()), contents_suffix);
 
     // 6. Construct JSON
-    let order_json = format!(r#"{{"salt":"{}","maker":"{}","signer":"{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","side":{},"signatureType":{},"timestamp":"{}","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","signature":"{}"}}"#,
-        salt, maker_addr.to_string(), signer_addr.to_string(), t_id, m_amt, t_amt, side, signature_type, timestamp, final_signature
+    let side_str = if side == 0 { "BUY" } else { "SELL" };
+    let order_json = format!(r#"{{"salt":{},"maker":"{}","signer":"{}","tokenId":"{}","makerAmount":"{}","takerAmount":"{}","side":"{}","signatureType":{},"timestamp":"{}","metadata":"0x0000000000000000000000000000000000000000000000000000000000000000","builder":"0x0000000000000000000000000000000000000000000000000000000000000000","expiration":"0","signature":"{}"}}"#,
+        salt, maker_addr.to_string(), signer_addr.to_string(), t_id, m_amt, t_amt, side_str, signature_type, timestamp, final_signature
     );
 
     (order_json, final_signature)
