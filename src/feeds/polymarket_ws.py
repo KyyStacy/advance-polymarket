@@ -97,7 +97,11 @@ class PolymarketBookFeed:
                 continue
             try:
                 async with websockets.connect(
-                    self.url, ping_interval=10, ping_timeout=10, max_queue=512
+                    self.url,
+                    ping_interval=10,
+                    ping_timeout=10,
+                    max_queue=256,
+                    compression=None,  # disable per-frame compression overhead
                 ) as ws:
                     self._ws = ws
                     sub = {"assets_ids": self.token_ids, "type": "market"}

@@ -130,3 +130,10 @@ perf.data
 debug/
 test_output/
 results/
+
+# Rust
+target/
+Cargo.lock
+# Maturin generates .pyd files; line 5 covers this but being explicit for the crate
+polymarket_hft.*.pyd
+rust_executor/target/

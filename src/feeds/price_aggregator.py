@@ -59,8 +59,16 @@ class PriceAggregator:
         # unreliable.  Wall-clock accurately reflects when we received the data.
         self.oracle.push(time.time(), price)
 
-    def latest_cex(self) -> Optional[tuple[float, float]]:
+    def latest_cex(self) -> tuple[float, float] | None:
         return self.cex_mid.latest()
 
-    def latest_oracle(self) -> Optional[tuple[float, float]]:
+    def latest_oracle(self) -> tuple[float, float] | None:
         return self.oracle.latest()
+
+    def has_cex(self) -> bool:
+        """O(1) check: True if at least one CEX tick has been received.
+
+        Use this on the hot tick path instead of `latest_cex() is not None`
+        to avoid constructing the (ts, value) tuple only to discard it.
+        """
+        return len(self.cex_mid) > 0

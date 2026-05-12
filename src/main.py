@@ -286,9 +286,9 @@ class TradingBot:
         now = time.time()
         sec_in = seconds_into_window(now)
         sec_left = seconds_left_in_window(now)
-        cex = self.agg.latest_cex()
-        if cex is None:
+        if not self.agg.has_cex():
             return
+        cex = self.agg.latest_cex()
 
         # Periodically refresh bankroll
         self._tick_count += 1

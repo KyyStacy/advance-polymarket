@@ -24,7 +24,9 @@ _FILL_POLL_INTERVAL_SEC = 0.25
 # Fast polling: Gnosis Safe relay can land a fill in 200–600ms, so the first
 # checks should be aggressive. Tighter initial poll (50ms) + exponential
 # backoff catches quick fills 50–100ms faster than the previous flat 100ms.
-_FILL_POLL_FAST_SEC = 0.05
+# Tighter initial poll: Gnosis Safe relay typically responds within 200–600ms.
+# 25ms first check catches quick fills ~25ms faster than previous 50ms.
+_FILL_POLL_FAST_SEC = 0.025
 _FILL_POLL_FAST_WINDOW_SEC = 2.0
 _FILL_POLL_BACKOFF_MULT = 1.5
 _FILL_POLL_MAX_SEC = 0.25
@@ -46,9 +48,11 @@ ENTRY_MAX_CASCADE_DRIFT = ENTRY_MAX_DRIFT
 # entries after the book settles or moves back toward the original signal).
 ENTRY_SIGNAL_ANCHOR_TTL_SEC = 30.0
 # Wall-clock deadline for the entire buy sequence.
-# Momentum signals in 5-minute Polymarket windows last ~1-2 seconds; fills landing
-# after this deadline are "stale" and almost always lose to immediate exit signals.
-_BUY_TOTAL_DEADLINE_SEC = 2.0
+# Reduced 2.0→1.5s: momentum signals in 5-min windows last ~0.5–1s; fills
+# landing after 1.5s are stale and almost always lose to immediate exit signals.
+# Tighter deadline means faster abort on slow books — better to skip and
+# re-evaluate than to sit in a dead order for 2 full seconds.
+_BUY_TOTAL_DEADLINE_SEC = 1.5
 _SELL_MAX_ATTEMPTS = 2
 _SELL_RETRY_DELAY_SEC = 0.020  # 20 ms — let book briefly re-quote between attempts
 # Reduced from 6→2 attempts: when attempt #1 FAK kills at worst_price, an instant
@@ -62,11 +66,12 @@ _SELL_API_TIMEOUT_SEC = 0.6
 # slow-relayer settlement on POLY_1271 deposit wallets. If actual settlement
 # proves consistently faster (1–4s typical), this can be tightened later.
 _SELL_FILL_POLL_DEADLINE_SEC = 20.0
-# Hard timeout per buy API call (sign + POST). Single attempt uses most of the
-# 2s signal budget, leaving 0.3s for ghost-fill check (150ms wait + balance read).
-# worst_price embedded in the order lets the exchange enforce the price ceiling —
-# no retry needed after a FAK kill.
-_BUY_API_TIMEOUT_SEC = 1.7
+# Hard timeout per buy API call (sign + POST).
+# Reduced 1.7→1.1s to match the tighter 1.5s total budget.
+# Leaves ~400ms for ghost-fill check (25ms wait + balance read + headroom).
+# Polymarket POST P50 ~150–250ms, P99 ~500ms — 1.1s is 2.2× P99.
+# A fill that takes >1.1s almost certainly won't arrive before the signal is stale.
+_BUY_API_TIMEOUT_SEC = 1.1
 # Minimum USD value for a sell order to be worth attempting.
 # Polymarket rejects orders where maker or taker amount is 0; small shares
 # at low prices (e.g. 0.006sh × 0.09 = $0.0005) always fail. Use 5¢ as
@@ -466,9 +471,11 @@ class OrderExecutor:
                     )
                 return
             # Sell confirmed on-chain → mark token balance as "known zero" for
-            # 30s so the buy hot path can skip the ~100ms balance pre-check on
-            # any re-entry within this window.
-            self._known_zero_until[token_id] = time.time() + 30.0
+            # 120s so the buy hot path can skip the ~100ms balance pre-check on
+            # any re-entry within this window (extended from 30s: HFT re-entries
+            # happen within seconds of a close; 30s TTL caused unnecessary cold
+            # fetches on the 2nd re-entry in the same window).
+            self._known_zero_until[token_id] = time.time() + 120.0
             diff = abs(avg - response_avg)
             if diff > 0.005:
                 log.warning(
@@ -686,10 +693,10 @@ class OrderExecutor:
             # check balance. Reduced 150→50ms: Gnosis Safe relay typically
             # responds <1s, 50ms is enough to catch a just-acknowledged fill
             # without wasting signal budget.
-            ghost_wait = 0.05
+            ghost_wait = 0.025
             if signal_ts_monotonic is not None:
                 remaining = _BUY_TOTAL_DEADLINE_SEC - (time.monotonic() - signal_ts_monotonic)
-                ghost_wait = max(0.0, min(0.05, remaining))
+                ghost_wait = max(0.0, min(0.025, remaining))
             if ghost_wait > 0:
                 await asyncio.sleep(ghost_wait)
             post_bal = await self.clob.get_token_balance(token_id)
