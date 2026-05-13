@@ -19,32 +19,29 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
         .expect("failed to build Tokio runtime")
 });
 
+/// Pre-computed signing context — immutable after construction.
+/// Stored in Arc so sign_and_post_order clones only the pointer (~1 atomic op)
+/// instead of 12+ String heap allocations per order.
+#[derive(Clone)]
+struct SigningContext {
+    chain_id: String,
+    private_key: String,
+    app_domain_ctf: String,
+    app_domain_neg_risk: String,
+    order_type_hash: String,
+    solady_type_hash: String,
+    wallet_name_hash: String,
+    wallet_version_hash: String,
+    wallet_salt: String,
+    contents_type_suffix: String,
+    signer_address: String,
+}
+
 #[pyclass]
 struct RustApiCreds {
     inner: ApiCreds,
-    // Signing context pre-computed by Python
-    #[pyo3(get)]
-    chain_id: String,
-    #[pyo3(get)]
-    private_key: String,
-    #[pyo3(get)]
-    app_domain_ctf: String,
-    #[pyo3(get)]
-    app_domain_neg_risk: String,
-    #[pyo3(get)]
-    order_type_hash: String,
-    #[pyo3(get)]
-    solady_type_hash: String,
-    #[pyo3(get)]
-    wallet_name_hash: String,
-    #[pyo3(get)]
-    wallet_version_hash: String,
-    #[pyo3(get)]
-    wallet_salt: String,
-    #[pyo3(get)]
-    contents_type_suffix: String,
-    #[pyo3(get)]
-    signer_address: String,
+    /// Pre-computed signing context (Arc-wrapped for zero-copy sharing).
+    ctx: Arc<SigningContext>,
 }
 
 #[pymethods]
@@ -70,17 +67,19 @@ impl RustApiCreds {
     ) -> Self {
         RustApiCreds {
             inner: ApiCreds::new(api_key, api_secret, api_passphrase),
-            chain_id: chain_id.to_string(),
-            private_key: private_key.to_string(),
-            app_domain_ctf: app_domain_ctf.to_string(),
-            app_domain_neg_risk: app_domain_neg_risk.to_string(),
-            order_type_hash: order_type_hash.to_string(),
-            solady_type_hash: solady_type_hash.to_string(),
-            wallet_name_hash: wallet_name_hash.to_string(),
-            wallet_version_hash: wallet_version_hash.to_string(),
-            wallet_salt: wallet_salt.to_string(),
-            contents_type_suffix: contents_type_suffix.to_string(),
-            signer_address: signer_address.to_string(),
+            ctx: Arc::new(SigningContext {
+                chain_id: chain_id.to_string(),
+                private_key: private_key.to_string(),
+                app_domain_ctf: app_domain_ctf.to_string(),
+                app_domain_neg_risk: app_domain_neg_risk.to_string(),
+                order_type_hash: order_type_hash.to_string(),
+                solady_type_hash: solady_type_hash.to_string(),
+                wallet_name_hash: wallet_name_hash.to_string(),
+                wallet_version_hash: wallet_version_hash.to_string(),
+                wallet_salt: wallet_salt.to_string(),
+                contents_type_suffix: contents_type_suffix.to_string(),
+                signer_address: signer_address.to_string(),
+            }),
         }
     }
 }
@@ -93,7 +92,7 @@ struct RustHttpPool {
 #[pymethods]
 impl RustHttpPool {
     #[new]
-    #[pyo3(signature = (clob_host, timeout_ms = 1100))]
+    #[pyo3(signature = (clob_host, timeout_ms = 2200))]
     fn new(clob_host: &str, timeout_ms: u64) -> PyResult<Self> {
         let pool = HttpPool::new(clob_host, timeout_ms).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -115,13 +114,15 @@ impl RustHttpPool {
     fn heartbeat(&self, py: Python<'_>, creds: &RustApiCreds) {
         let pool = Arc::clone(&self.pool);
         let inner_creds = creds.inner.clone();
-        let signer = creds.signer_address.clone();
+        let signer = creds.ctx.signer_address.clone();
         py.allow_threads(|| {
             TOKIO_RT.block_on(async move { pool.heartbeat(&inner_creds, &signer).await });
         });
     }
 
-    /// Complete HFT flow: Sign EIP-1271 order and POST in Rust
+    /// Complete HFT flow: Sign EIP-1271 order and POST in Rust.
+    /// Uses Arc<SigningContext> — only 1 atomic ref-count increment per call
+    /// instead of 12+ String heap allocations.
     #[allow(clippy::too_many_arguments)]
     fn sign_and_post_order(
         &self,
@@ -137,17 +138,7 @@ impl RustHttpPool {
     ) -> PyResult<String> {
         let pool = Arc::clone(&self.pool);
         let inner_creds = creds.inner.clone();
-
-        // Pass signing context
-        let chain_id = creds.chain_id.clone();
-        let pk = creds.private_key.clone();
-        let app_domain = if neg_risk { creds.app_domain_neg_risk.clone() } else { creds.app_domain_ctf.clone() };
-        let type_hash = creds.order_type_hash.clone();
-        let solady_hash = creds.solady_type_hash.clone();
-        let w_name = creds.wallet_name_hash.clone();
-        let w_version = creds.wallet_version_hash.clone();
-        let w_salt = creds.wallet_salt.clone();
-        let contents_suffix = creds.contents_type_suffix.clone();
+        let ctx = Arc::clone(&creds.ctx);
 
         let maker = maker.to_string();
         let signer = signer.to_string();
@@ -156,22 +147,27 @@ impl RustHttpPool {
         let taker_amount = taker_amount.to_string();
 
         let result = py.allow_threads(move || {
+            // Select domain based on neg_risk flag.
+            let app_domain = if neg_risk { &ctx.app_domain_neg_risk } else { &ctx.app_domain_ctf };
+
             // 1. Generate Order & Sign
             let (order_json, _signature) = signer::build_and_sign_order(
-                &chain_id, &pk, &app_domain, &type_hash, &solady_hash,
-                &w_name, &w_version, &w_salt, &contents_suffix,
+                &ctx.chain_id, &ctx.private_key, app_domain, &ctx.order_type_hash,
+                &ctx.solady_type_hash, &ctx.wallet_name_hash, &ctx.wallet_version_hash,
+                &ctx.wallet_salt, &ctx.contents_type_suffix,
                 &maker, &signer, &token_id, &maker_amount, &taker_amount, side
             );
             
-            // 2. Format final payload - must include deferExec+postOnly like order_to_json_v2()
+            // 2. Format final payload
             let payload = format!(
                 r#"{{"order":{},"owner":"{}","orderType":"FAK","deferExec":false,"postOnly":false}}"#,
                 order_json, inner_creds.api_key
             );
-            let hmac_signer = creds.signer_address.clone();
 
             // 3. POST
-            TOKIO_RT.block_on(async move { pool.post_order_json(&payload, &inner_creds, &hmac_signer).await })
+            TOKIO_RT.block_on(async move {
+                pool.post_order_json(&payload, &inner_creds, &ctx.signer_address).await
+            })
         });
 
         match result {
@@ -196,26 +192,14 @@ impl RustHttpPool {
         neg_risk: bool,
     ) -> PyResult<String> {
         let inner_creds = creds.inner.clone();
-        let chain_id = creds.chain_id.clone();
-        let pk = creds.private_key.clone();
-        let app_domain = if neg_risk { creds.app_domain_neg_risk.clone() } else { creds.app_domain_ctf.clone() };
-        let type_hash = creds.order_type_hash.clone();
-        let solady_hash = creds.solady_type_hash.clone();
-        let w_name = creds.wallet_name_hash.clone();
-        let w_version = creds.wallet_version_hash.clone();
-        let w_salt = creds.wallet_salt.clone();
-        let contents_suffix = creds.contents_type_suffix.clone();
-
-        let maker = maker.to_string();
-        let signer = signer.to_string();
-        let token_id = token_id.to_string();
-        let maker_amount = maker_amount.to_string();
-        let taker_amount = taker_amount.to_string();
+        let ctx = &creds.ctx;
+        let app_domain = if neg_risk { &ctx.app_domain_neg_risk } else { &ctx.app_domain_ctf };
 
         let (order_json, _sig) = signer::build_and_sign_order(
-            &chain_id, &pk, &app_domain, &type_hash, &solady_hash,
-            &w_name, &w_version, &w_salt, &contents_suffix,
-            &maker, &signer, &token_id, &maker_amount, &taker_amount, side
+            &ctx.chain_id, &ctx.private_key, app_domain, &ctx.order_type_hash,
+            &ctx.solady_type_hash, &ctx.wallet_name_hash, &ctx.wallet_version_hash,
+            &ctx.wallet_salt, &ctx.contents_type_suffix,
+            maker, signer, token_id, maker_amount, taker_amount, side
         );
         let payload = format!(
             r#"{{"order":{},"owner":"{}","orderType":"FAK","deferExec":false,"postOnly":false}}"#,
@@ -234,7 +218,7 @@ impl RustHttpPool {
         let pool = Arc::clone(&self.pool);
         let creds_inner = creds.inner.clone();
         let body = order_json.to_owned();
-        let signer_addr = creds.signer_address.clone();
+        let signer_addr = creds.ctx.signer_address.clone();
 
         let result = py.allow_threads(move || {
             TOKIO_RT.block_on(async move { pool.post_order_json(&body, &creds_inner, &signer_addr).await })

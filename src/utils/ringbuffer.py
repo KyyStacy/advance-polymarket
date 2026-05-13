@@ -16,6 +16,9 @@ class TimedSeries:
       - arrays_in_window() returns numpy views — no extra allocation for callers
         that work directly with numpy (e.g. MomentumAnalyzer).
       - latest() is O(1) indexed access.
+      - _ordered_arrays() uses slice concatenation instead of np.roll() to avoid
+        double-allocation on full buffers. Result is cached between pushes so
+        multiple callers in the same tick (momentum + leadlag) pay zero cost.
 
     Thread-safety: NOT thread-safe. All access must be from the asyncio event
     loop thread. Matches the existing single-threaded usage pattern.
@@ -28,12 +31,17 @@ class TimedSeries:
     _vals: np.ndarray = field(init=False, repr=False)  # values (float64)
     _head: int = field(init=False, repr=False)          # next write index (mod maxlen)
     _size: int = field(init=False, repr=False)          # occupied count [0, maxlen]
+    # Cache: invalidated on every push(), recomputed lazily on first read.
+    _cache_ts: np.ndarray | None = field(init=False, repr=False, default=None)
+    _cache_vals: np.ndarray | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         self._ts = np.empty(self.maxlen, dtype=np.float64)
         self._vals = np.empty(self.maxlen, dtype=np.float64)
         self._head = 0
         self._size = 0
+        self._cache_ts = None
+        self._cache_vals = None
 
     # ------------------------------------------------------------------ write
 
@@ -44,6 +52,9 @@ class TimedSeries:
         self._head = (self._head + 1) % self.maxlen
         if self._size < self.maxlen:
             self._size += 1
+        # Invalidate ordered cache — next reader will rebuild.
+        self._cache_ts = None
+        self._cache_vals = None
 
     # ------------------------------------------------------------------ read
 
@@ -57,25 +68,33 @@ class TimedSeries:
     def _ordered_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         """Return (ts, vals) in chronological order (oldest first).
 
-        When the buffer is not yet full the valid data is contiguous at
-        [:_size] — no copy needed, just a slice view.
-        When full the circular data is linearised with np.roll (C-level
-        memcpy, ~10× faster than a Python-level loop over the same n items).
+        Cached between pushes — multiple callers within the same tick pay
+        zero cost after the first call.  Uses slice concatenation instead of
+        np.roll to avoid the double-allocation that roll performs internally.
         """
+        if self._cache_ts is not None:
+            return self._cache_ts, self._cache_vals  # type: ignore[return-value]
+
         if self._size < self.maxlen:
-            return self._ts[:self._size], self._vals[:self._size]
-        # Full: rotate so oldest element lands at index 0.
-        return (
-            np.roll(self._ts, -self._head),
-            np.roll(self._vals, -self._head),
-        )
+            ts = self._ts[:self._size]
+            vals = self._vals[:self._size]
+        else:
+            # Full buffer: linearise by concatenating [head:] + [:head].
+            # np.concatenate does ONE allocation + two contiguous memcpy calls,
+            # vs np.roll which does TWO full-array allocations.
+            h = self._head
+            ts = np.concatenate((self._ts[h:], self._ts[:h]))
+            vals = np.concatenate((self._vals[h:], self._vals[:h]))
+
+        self._cache_ts = ts
+        self._cache_vals = vals
+        return ts, vals
 
     def arrays_in_window(
         self, seconds: float, now: float
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return (timestamps, values) arrays for items with ts >= (now - seconds).
 
-        Matches the original deque implementation's `t >= cutoff` semantics.
         Uses np.searchsorted side='left': the returned slice starts at the first
         timestamp >= cutoff (inclusive boundary). O(log n) via binary search.
         Prefer this over items_in_window() in numeric callers to avoid Python
@@ -85,8 +104,6 @@ class TimedSeries:
             _empty = np.empty(0, dtype=np.float64)
             return _empty, _empty
         ts_ord, vals_ord = self._ordered_arrays()
-        # Subtract a tiny epsilon so items at exactly `cutoff` are included,
-        # matching the original `t >= cutoff` filter without boundary ambiguity.
         idx = int(np.searchsorted(ts_ord, now - seconds - 1e-9, side="right"))
         return ts_ord[idx:], vals_ord[idx:]
 
@@ -100,8 +117,6 @@ class TimedSeries:
     ) -> Iterable[Tuple[float, float]]:
         """Legacy: iterable of (ts, value) tuples. Prefer arrays_in_window()."""
         ts, vals = self.arrays_in_window(seconds, now)
-        # zip over numpy scalars — avoids a full Python list comprehension but
-        # still O(n) for callers that need individual tuples.
         return zip(ts.tolist(), vals.tolist())
 
     def __len__(self) -> int:

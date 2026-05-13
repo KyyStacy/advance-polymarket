@@ -22,6 +22,10 @@ class Position:
     # SELL signs against wrong exchange contract and gets 400 "signer address".
     neg_risk: bool = False
     tick_size: float = 0.01
+    
+    # Latch to remember that an exit was decided. Prevents the bot from holding
+    # a losing position if the sell fails and the exit signal briefly disappears.
+    exit_intent_latched: bool = False
 
     def unrealized_pnl(self, mark_price: float) -> float:
         return (mark_price - self.entry_price) * self.size_shares
@@ -69,3 +73,7 @@ class PositionTracker:
                 if p.market_window_ts == window_ts:
                     return p
             return None
+
+    def remove(self, token_id: str) -> Position | None:
+        """Alias for pop_open — used by ghost-fill recovery paths."""
+        return self.pop_open(token_id)

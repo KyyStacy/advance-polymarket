@@ -35,23 +35,21 @@ _BALANCE_DELTA_EPSILON = 0.005
 # Max ask drift (absolute USD) validated in main.py before calling buy_to_open.
 # Kept here as a named constant so entry_engine / main.py can import it as
 # the single source of truth for the drift gate threshold.
-ENTRY_MAX_DRIFT = 0.04
+# Adjusted to 0.03: Balances protection against massive slippage while
+# allowing enough room for fills in typically thin Polymarket order books.
+ENTRY_MAX_DRIFT = 0.03
 # Hard cap on how far the ask can drift FROM THE ORIGINAL SIGNAL across an
 # entire entry attempt sequence (across multiple buy_to_open calls within the
 # same window+side). Must equal ENTRY_MAX_DRIFT so the cascade gate and the
 # per-call gate enforce the same absolute ceiling (first_ask + ENTRY_MAX_DRIFT).
-# If this were larger than ENTRY_MAX_DRIFT, repeated FAK kills could let the
-# strategy chase a runaway book: per-call gate resets each new call while
-# cascade gate lets it through — bot chased 0.06→0.21 in case 2.
 ENTRY_MAX_CASCADE_DRIFT = ENTRY_MAX_DRIFT
 # Forget the signal anchor after this many seconds of inactivity (allows fresh
 # entries after the book settles or moves back toward the original signal).
 ENTRY_SIGNAL_ANCHOR_TTL_SEC = 30.0
-# Reduced 2.0→1.5s: momentum signals in 5-min windows last ~0.5–1s; fills
-# landing after 1.5s are stale and almost always lose to immediate exit signals.
-# Tighter deadline means faster abort on slow books — better to skip and
-# re-evaluate than to sit in a dead order for 2 full seconds.
-_BUY_TOTAL_DEADLINE_SEC = 2.0
+# BUY total budget: Rust pool timeout (2.2s) + ghost-fill poll (0.5s) + margin (0.3s) = 3.0s.
+# Reduced from 3.5s: Rust pool now has 2.2s per-request timeout which covers P99 (~2.3s)
+# without Python needing an extra generous buffer.
+_BUY_TOTAL_DEADLINE_SEC = 3.0
 _SELL_MAX_ATTEMPTS = 3
 _SELL_RETRY_DELAY_SEC = 0.020  # 20 ms — let book briefly re-quote between attempts
 # Reduced from 6→2 attempts: when attempt #1 FAK kills at worst_price, an instant
@@ -60,16 +58,17 @@ _SELL_RETRY_DELAY_SEC = 0.020  # 20 ms — let book briefly re-quote between att
 # book depth). Total sell budget: ~3s worst-case vs 12s previously.
 # Polymarket POST P50 ~150–250ms, P99 ~500ms. Cutting from 1.5s → 0.6s
 # saves up to ~1s per dead attempt while keeping a 2× safety margin over P99.
-_SELL_API_TIMEOUT_SEC = 1.2
+# Increased 1.2→2.0s: Rust HFT path adds signing time (ECDSA) on top of network;
+# Polymarket SELL P99 can hit 1.5s during congestion. 2.0s = 1.33× P99 buffer.
+_SELL_API_TIMEOUT_SEC = 2.0
 # Sell reconciliation deadline. Kept at 20s as a conservative cap covering
-# slow-relayer settlement on POLY_1271 deposit wallets. If actual settlement
-# proves consistently faster (1–4s typical), this can be tightened later.
+# slow-relayer settlement on POLY_1271 deposit wallets.
 _SELL_FILL_POLL_DEADLINE_SEC = 20.0
-# Reduced 1.7→1.1s to match the tighter 1.5s total budget.
-# Leaves ~400ms for ghost-fill check (25ms wait + balance read + headroom).
-# Polymarket POST P50 ~150–250ms, P99 ~500ms — 1.1s is 2.2× P99.
-# A fill that takes >1.1s almost certainly won't arrive before the signal is stale.
-_BUY_API_TIMEOUT_SEC = 1.5
+# Increased 1.5→2.5s: ~30% of buy orders are landing late ("Duplicated" errors
+# = order succeeded but response arrived after our 1.5s cutoff, triggering retry).
+# 2.5s matches the observed P99 latency of ~2.3s for successful fills.
+# This DIRECTLY fixes the ~72% timeout rate observed in the session.
+_BUY_API_TIMEOUT_SEC = 2.5
 # Minimum USD value for a sell order to be worth attempting.
 # Polymarket rejects orders where maker or taker amount is 0; small shares
 # at low prices (e.g. 0.006sh × 0.09 = $0.0005) always fail. Use 5¢ as
@@ -773,6 +772,11 @@ class OrderExecutor:
                     f"[exec] GHOST BUY recovered {side_label} {ghost_fill_delta:.4f}sh "
                     f"@~{expected_ask:.4f} in {elapsed_ms:.0f}ms"
                 )
+                # CRITICAL: add minimum 2s delay before first sell attempt.
+                # Gnosis Safe ERC-1155 mint takes 1-3s to confirm on-chain after
+                # the order is matched. Without this wait, the first sell immediately
+                # gets "balance: 0" because the tokens haven't landed yet.
+                self._last_sell_ts[token_id] = time.time() + 2.0
                 return FillReport(
                     True, expected_ask, ghost_fill_delta,
                     ghost_fill_delta * expected_ask, {}, error="timeout-recovered",
@@ -854,6 +858,12 @@ class OrderExecutor:
             asyncio.ensure_future(
                 self._bg_reconcile_buy(token_id, pre_token, pre_pusd, est_size, est_cost, pos_opened_at)
             )
+            # Add a minimum sell guard: the Gnosis Safe ERC-1155 mint from a normal
+            # matched order typically takes 1-3s to appear on-chain. Without a brief
+            # delay the exit path hits "balance: 0" errors on the very first sell tick.
+            # 1.5s is the conservative floor — ghost fills already use 2.0s above.
+            if token_id not in self._last_sell_ts or self._last_sell_ts.get(token_id, 0) < time.time():
+                self._last_sell_ts[token_id] = time.time() + 1.5
             return FillReport(True, est_avg, est_size, est_cost, resp, reconciled=from_response)
         finally:
             self._pending_buys.discard(token_id)
@@ -1137,6 +1147,30 @@ class OrderExecutor:
                     sold_shares = min(cur_bal, sold_shares)
                     resp = None
                     continue
+            # Handle "Duplicated" sell: means a prior attempt with same nonce was
+            # accepted by the chain. Poll balance to verify if tokens cleared.
+            if "duplicated" in err_msg.lower() and attempt <= _SELL_MAX_ATTEMPTS:
+                log.warning(
+                    f"[exec] SELL Duplicated — prior attempt may have filled. "
+                    f"Polling {1.5:.0f}s for balance confirmation..."
+                )
+                await asyncio.sleep(0.5)
+                cur_bal = await self._get_token_balance_with_retry(token_id)
+                if cur_bal is None or cur_bal < sold_shares * 0.50:
+                    log.info(
+                        f"[exec] SELL Duplicated confirmed: {sold_shares:.4f}sh cleared "
+                        f"(residual: {cur_bal or 0:.4f}sh)"
+                    )
+                    self.positions.close(token_id, mark_price)
+                    self._last_sell_ts[token_id] = time.time()
+                    self._slow_settlement_tokens.discard(token_id)
+                    self._counters["sell_filled"] += 1
+                    return FillReport(True, mark_price, sold_shares, mark_price * sold_shares, {})
+                # Tokens still present — keep trying
+                sold_shares = min(cur_bal or sold_shares, sold_shares)
+                resp = None
+                continue
+
             # Non-retryable response error (or last FAK attempt via response path)
             if is_fak:
                 self._counters["sell_fak_killed"] += 1

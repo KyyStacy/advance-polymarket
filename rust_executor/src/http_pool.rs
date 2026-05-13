@@ -99,9 +99,10 @@ impl HttpPool {
                 // If it's a connection error (e.g. idle connection was dropped),
                 // retry ONCE with a fresh request. Reqwest will handle opening
                 // a new connection in its pool.
+                let auth2 = build_auth_headers(creds, signer_address, path, order_body);
                 let mut req2 = self.client.post(&url).body(order_body.to_owned());
                 req2 = req2.header("Content-Type", "application/json");
-                for (k, v) in &auth {
+                for (k, v) in &auth2 {
                     req2 = req2.header(k.as_str(), v.as_str());
                 }
                 let resp = req2.send().await?;

@@ -39,9 +39,9 @@ class ExitEngine:
     # Tighter threshold triggers stale-exit 3× faster on actual feed loss.
     STALE_EXIT_SECONDS = 10.0
     # Minimum hold time after entry before signal-based exits can fire.
-    # Without this, z dropping from 2.94→1.83 in 12s (noise reversion) was
-    # triggering exits seconds after entry on strong signal.
-    MIN_HOLD_SECONDS = 45.0
+    # Reduced 45→30s: most losing trades show clear reversal within 15-30s.
+    # Tighter floor means we cut confirmed losses faster instead of waiting.
+    MIN_HOLD_SECONDS = 30.0
     # Hard floor against own-fill adverse selection: own market buy moves the
     # ask and immediately tilts the fair-probability estimate against us. Side
     # flip / take-profit can otherwise fire on the same tick as the fill and
@@ -54,10 +54,11 @@ class ExitEngine:
     TAKE_PROFIT_PCT = 3.00
     # Trailing stop: once peak unrealized >= TRAILING_STOP_MIN_PEAK,
     # exit if current unrealized drops TRAILING_STOP_DIST from the peak.
-    # Activates at 30% peak; 25pp drawdown from peak triggers exit.
-    # Example: peak=150% → exit if mark falls back to 125%.
-    TRAILING_STOP_MIN_PEAK = 0.30
-    TRAILING_STOP_DIST = 0.25
+    # Raised to 40%/30pp: Polymarket thin books have wide bid-ask spreads
+    # causing noisy bid prints that false-fire trailing stops too early.
+    # Requires a more sustained profit peak before activating protection.
+    TRAILING_STOP_MIN_PEAK = 0.40
+    TRAILING_STOP_DIST = 0.30
     # P&L threshold separating "cut fast" vs "let it run" regimes
     PROFIT_HOLD_PCT = 0.10
     # Loss-regime adverse z floor. Should be >= entry threshold
@@ -83,6 +84,11 @@ class ExitEngine:
     # Prevents cutting on noise reversion that hasn't reached real conviction.
     LEADLAG_EXIT_MIN_LOSS_PCT = -0.15        # only consider leadlag exit if loss > 15%
 
+    # Hard stop loss to prevent full wipes on runaway markets.
+    # If a position drops 40%, cut it immediately regardless of signal state.
+    # Prevents holding -95% positions just because z-score dipped from 2.01 to 1.99.
+    HARD_STOP_LOSS_PCT = -0.40
+
     def __init__(self, settings: Settings):
         self.s = settings
         self._last_mispricing_ts: float = time.time()  # init to now so first ticks get a grace period
@@ -101,6 +107,10 @@ class ExitEngine:
         # Hard time floor — always honor before resolution lag eats us
         if seconds_left <= self.s.exit_hard_floor_sec:
             return ExitDecision(True, f"time-floor<={self.s.exit_hard_floor_sec}s")
+
+        # Hard stop-loss — unconditionally cut deep losers
+        if unrealized_pct <= self.HARD_STOP_LOSS_PCT:
+            return ExitDecision(True, f"hard-stop-loss unreal={unrealized_pct:+.1%}<={self.HARD_STOP_LOSS_PCT:+.1%}")
 
         now = time.time()
         if mispricing is None:

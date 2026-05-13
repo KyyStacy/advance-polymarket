@@ -24,22 +24,17 @@ class MomentumAnalyzer:
     z_score = |mean(returns)| / std(returns) over recent 60s ticks.
     Direction confirmed when 30s and 60s returns agree in sign and z_score >= threshold.
 
-    Performance notes (Phase 1 optimisations):
-      - Uses TimedSeries.arrays_in_window() to receive numpy arrays directly,
-        eliminating the list-comprehension + np.array() conversion that cost
-        3–8 ms per cache miss previously.
-      - Cache invalidation now checks both timestamp AND buffer size so that
-        rapid bursts of ticks (e.g. Binance bookTicker at ~100 ms) don't
-        redundantly recompute when the reading hasn't materially changed.
-      - Return scalars pre-cast to float/int to avoid repeated numpy scalar
-        boxing on callers that do arithmetic with them.
+    Performance optimisations:
+      - Uses TimedSeries.arrays_in_window() to receive numpy arrays directly.
+      - Cached ordered arrays in TimedSeries mean multiple callers per tick
+        share the same linearised buffer (zero extra allocation).
+      - Cache gate checks both buffer size AND latest timestamp to avoid
+        redundant recomputes when data hasn't changed.
+      - Return scalars pre-cast to float/int to avoid numpy scalar boxing.
     """
 
     # Re-read at most once per this interval, even if data changes.
-    # CEX mid typically updates every 50–200 ms; momentum stats over a 60 s
-    # window are dominated by older ticks and rarely change meaningfully
-    # within a single 50 ms strategy tick.
-    _CACHE_TTL_SEC: float = 0.050
+    _CACHE_TTL_SEC: float = 0.040  # Tightened 50→40ms for faster signal response.
 
     def __init__(self, agg: PriceAggregator) -> None:
         self.agg = agg
@@ -63,7 +58,8 @@ class MomentumAnalyzer:
 
         # --- Full recompute -----------------------------------------------
         # arrays_in_window() returns numpy arrays directly — zero Python-level
-        # element iteration (all work in NumPy C layer).
+        # element iteration. Cached ordered arrays mean this is ~free if
+        # called multiple times within the same tick.
         ts, px = self.agg.cex_mid.arrays_in_window(60.0, now)
         n = len(px)
 
@@ -80,7 +76,7 @@ class MomentumAnalyzer:
         if px[0] <= 0 or px[-1] <= 0:
             return _empty
 
-        # Log returns between consecutive ticks — still O(n) but entirely in C.
+        # Log returns between consecutive ticks — entirely in C layer.
         rets = np.diff(np.log(px))
         if rets.size < 4:
             return _empty
@@ -91,10 +87,8 @@ class MomentumAnalyzer:
 
         # 30 s vs 60 s log returns — use searchsorted on already-ordered ts.
         cutoff_30 = now - 30.0
-        cutoff_60 = now - 60.0  # redundant (window is 60 s) but explicit
 
         idx_30 = int(np.searchsorted(ts, cutoff_30, side="left"))
-        # 60 s window: ts[0] is already the oldest within 60 s from arrays_in_window.
         r30 = 0.0
         if n - idx_30 >= 2:
             r30 = float(math.log(px[-1] / px[idx_30]))
@@ -103,7 +97,6 @@ class MomentumAnalyzer:
             r60 = float(math.log(px[-1] / px[0]))
 
         # Acceleration: late half (last 30 s) vs early half (30–60 s ago).
-        # idx_30 splits the arrays: early = [:idx_30], late = [idx_30:]
         px_early = px[:idx_30]
         px_late = px[idx_30:]
         if px_early.size >= 2 and px_late.size >= 2:

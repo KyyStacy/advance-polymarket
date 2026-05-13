@@ -270,7 +270,7 @@ class PolymarketClobClient:
                     _c_type + _c_len,
                     _b.signer.address()
                 )
-                self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host, 1500)
+                self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host)
                 log.info(f"[clob] Rust HTTP/2 pool active ({self._rust_pool})")
             except Exception as e:
                 log.error(f"[clob] Failed to init Rust HFT path: {e}")
@@ -477,10 +477,10 @@ class PolymarketClobClient:
                     0,  # BUY side
                     neg_risk
                 )
-                sign_ms = (time.monotonic() - _t_ffi) * 1000  # approximates the entire blocking call
+                sign_ms = (time.monotonic() - _t_ffi) * 1000
                 
-                # FORCE LOG FOR DEBUGGING
-                log.warning(f"[clob.diag] BUY HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
+                if _debug:
+                    log.debug(f"[clob.diag] BUY HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
                 
                 return orjson.loads(resp_str)
             else:
@@ -555,6 +555,9 @@ class PolymarketClobClient:
     ) -> dict:
         """True market sell using MarketOrderArgsV2.
         Uses Rust HFT path for minimal latency.
+        MUST run FFI call via asyncio.to_thread() to avoid blocking the
+        event loop — the Rust side calls TOKIO_RT.block_on() which blocks
+        the calling thread for the entire HTTP round-trip.
         """
         await self.ensure_ready()
         
@@ -562,24 +565,30 @@ class PolymarketClobClient:
             from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
             import orjson
             rc = ROUNDING_CONFIG[tick_size]
-            _, m_amt, t_amt = self.client.builder.get_market_order_amounts(
+            _client = self.client
+            _, m_amt, t_amt = _client.builder.get_market_order_amounts(
                 SELL, size_shares, worst_price, rc
             )
-            
+            _rust_pool = self._rust_pool
+            _rust_creds = self._rust_creds
+            _funder = _client.builder.funder
+            _signer = _client.builder._v2_order_signer()
+            _debug = _DEBUG_ENABLED
+            _m_amt_s = str(m_amt)
+            _t_amt_s = str(t_amt)
+
+            def _sell_ffi() -> str:
+                return _rust_pool.sign_and_post_order(
+                    _rust_creds, _funder, _signer, token_id,
+                    _m_amt_s, _t_amt_s, 1, neg_risk,
+                )
+
             _t_ffi = time.monotonic()
-            resp_str = self._rust_pool.sign_and_post_order(
-                self._rust_creds,
-                self.client.builder.funder,
-                self.client.builder._v2_order_signer(),
-                token_id,
-                str(m_amt),
-                str(t_amt),
-                1,  # SELL side
-                neg_risk
-            )
+            resp_str = await asyncio.to_thread(_sell_ffi)
             sign_ms = (time.monotonic() - _t_ffi) * 1000
             
-            log.warning(f"[clob.diag] SELL HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
+            if _debug:
+                log.debug(f"[clob.diag] SELL HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
             resp = orjson.loads(resp_str)
             if isinstance(resp, dict):
                 resp.setdefault("_sign_ms", 0.0)

@@ -336,6 +336,13 @@ class TradingBot:
                 existing.side, sec_left, mom, ll, misp, unreal_pct, seconds_held,
                 peak_unreal=self._peak_unreal,
             )
+            
+            if ed.exit:
+                existing.exit_intent_latched = True
+            elif existing.exit_intent_latched:
+                ed.exit = True
+                ed.reason = "latched-exit-retry"
+                
             if ed.exit:
                 # Throttle: if sell just failed, wait 1s before retrying to avoid
                 # 50ms-tick spam. 6 internal retries × ~300ms each ≈ 1.8s per call;
@@ -581,11 +588,11 @@ class TradingBot:
             except Exception as e:
                 self.log.exception(f"[bot] tick error: {e}")
             # Event-driven trigger: re-evaluate immediately on any WS book update,
-            # otherwise wake every 100ms while actively trading (window
-            # rollover, oracle ticks) or 1s when idle (saves CPU without
-            # affecting signal latency — no open position to act on anyway).
+            # otherwise wake every 50ms while actively trading (exit signals fire
+            # within ~5ms of a WS update; 50ms ceiling catches CEX/oracle ticks
+            # that don't trigger the WS event) or 500ms when idle.
             self._tick_event.clear()
-            watchdog = 0.1 if self.positions.open else 1.0
+            watchdog = 0.05 if self.positions.open else 0.5
             try:
                 await asyncio.wait_for(self._tick_event.wait(), timeout=watchdog)
             except asyncio.TimeoutError:
