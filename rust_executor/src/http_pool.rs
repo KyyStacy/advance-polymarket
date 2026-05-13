@@ -30,18 +30,17 @@ impl HttpPool {
     /// `timeout_ms` — per-request timeout in milliseconds.
     pub fn new(base_url: &str, timeout_ms: u64) -> Result<Self, reqwest::Error> {
         let client = ClientBuilder::new()
-            // HTTP/2 with adaptive flow control and PING keepalive.
-            .http2_prior_knowledge()          // skip HTTP/1.1 upgrade dance
+            // Standard HTTP/2 + ALPN negotiation. Prior knowledge is too fragile
+            // and often causes "error sending request" on mid-connection drops.
             .http2_keep_alive_interval(Duration::from_secs(10))
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .http2_keep_alive_while_idle(true)
-            // Connection pool: keep 2 idle connections open so burst orders
-            // don't wait for a new connection.
-            .pool_max_idle_per_host(2)
+            // Connection pool: keep more idle connections open for burst orders.
+            .pool_max_idle_per_host(5)
             .pool_idle_timeout(Duration::from_secs(90))
             // Per-request wall-clock timeout.
             .timeout(Duration::from_millis(timeout_ms))
-            // Use rustls (pure Rust TLS - no OpenSSL dependency on Windows).
+            // Use rustls (pure Rust TLS).
             .use_rustls_tls()
             .build()?;
 
@@ -49,6 +48,19 @@ impl HttpPool {
             client,
             base_url: base_url.trim_end_matches('/').to_owned(),
         })
+    }
+
+    /// Maintain connection liveness by hitting the authenticated /heartbeat endpoint.
+    /// Prevents TCP/TLS idle timeouts and supports "Cancel on Disconnect".
+    pub async fn heartbeat(&self, creds: &ApiCreds, signer_address: &str) {
+        let path = "/heartbeat";
+        let auth = build_auth_headers(creds, signer_address, path, "");
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.get(&url);
+        for (k, v) in &auth {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let _ = req.send().await;
     }
 
     /// Pre-warm the connection: send a cheap HEAD request so the TLS
@@ -72,16 +84,30 @@ impl HttpPool {
     ) -> Result<String, reqwest::Error> {
         let path = "/order";
         let auth = build_auth_headers(creds, signer_address, path, order_body);
-
         let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.post(&url).body(order_body.to_owned());
 
+        // Attempt 1
+        let mut req = self.client.post(&url).body(order_body.to_owned());
         req = req.header("Content-Type", "application/json");
         for (k, v) in &auth {
             req = req.header(k.as_str(), v.as_str());
         }
 
-        let resp = req.send().await?;
-        resp.text().await
+        match req.send().await {
+            Ok(resp) => resp.text().await,
+            Err(e) if e.is_connect() || e.is_timeout() => {
+                // If it's a connection error (e.g. idle connection was dropped),
+                // retry ONCE with a fresh request. Reqwest will handle opening
+                // a new connection in its pool.
+                let mut req2 = self.client.post(&url).body(order_body.to_owned());
+                req2 = req2.header("Content-Type", "application/json");
+                for (k, v) in &auth {
+                    req2 = req2.header(k.as_str(), v.as_str());
+                }
+                let resp = req2.send().await?;
+                resp.text().await
+            }
+            Err(e) => Err(e),
+        }
     }
 }

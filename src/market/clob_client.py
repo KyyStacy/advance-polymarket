@@ -270,7 +270,7 @@ class PolymarketClobClient:
                     _c_type + _c_len,
                     _b.signer.address()
                 )
-                self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host, 1100)
+                self._rust_pool = polymarket_hft.RustHttpPool(self.s.clob_host, 1500)
                 log.info(f"[clob] Rust HTTP/2 pool active ({self._rust_pool})")
             except Exception as e:
                 log.error(f"[clob] Failed to init Rust HFT path: {e}")
@@ -294,9 +294,23 @@ class PolymarketClobClient:
             if self._rust_pool:
                 try:
                     await asyncio.to_thread(self._rust_pool.warm_up)
+                    # Start background heartbeat loop
+                    asyncio.create_task(self._heartbeat_loop())
                 except Exception as e:
                     log.warning(f"[clob] Rust pool warmup failed: {e}")
             log.info("[clob] V2 client ready")
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodic authenticated pulse to keep the Rust HTTP/2 pool alive."""
+        while self._rust_pool and self._rust_creds:
+            try:
+                await asyncio.to_thread(self._rust_pool.heartbeat, self._rust_creds)
+                # 7s is a safe interval — Polymarket expects < 10s for CoD,
+                # and it's tight enough to keep AWS/LB idle timers happy.
+                await asyncio.sleep(7.0)
+            except Exception as e:
+                log.warning(f"[clob] Rust heartbeat failed: {e}")
+                await asyncio.sleep(5.0)
 
     @property
     def client(self) -> ClobClient:
@@ -534,67 +548,52 @@ class PolymarketClobClient:
         self,
         token_id: str,
         size_shares: float,
+        worst_price: float = 0.01,
         *,
         neg_risk: bool,
         tick_size: str = "0.01",
     ) -> dict:
         """True market sell using MarketOrderArgsV2.
-
-        `neg_risk` MUST match the buy-side neg_risk for the same token —
-        otherwise the sell order signs against a different exchange contract
-        than the position is held in, and is rejected.
+        Uses Rust HFT path for minimal latency.
         """
         await self.ensure_ready()
+        
+        if self._rust_pool and self._rust_creds:
+            from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+            import orjson
+            rc = ROUNDING_CONFIG[tick_size]
+            _, m_amt, t_amt = self.client.builder.get_market_order_amounts(
+                SELL, size_shares, worst_price, rc
+            )
+            
+            _t_ffi = time.monotonic()
+            resp_str = self._rust_pool.sign_and_post_order(
+                self._rust_creds,
+                self.client.builder.funder,
+                self.client.builder._v2_order_signer(),
+                token_id,
+                str(m_amt),
+                str(t_amt),
+                1,  # SELL side
+                neg_risk
+            )
+            sign_ms = (time.monotonic() - _t_ffi) * 1000
+            
+            log.warning(f"[clob.diag] SELL HFT post ffi_ms={sign_ms:.1f} resp={resp_str[:300]}")
+            resp = orjson.loads(resp_str)
+            if isinstance(resp, dict):
+                resp.setdefault("_sign_ms", 0.0)
+                resp.setdefault("_post_ms", sign_ms)
+                return resp
+            return {"raw": resp, "_sign_ms": 0.0, "_post_ms": sign_ms}
+        
+        # Fallback to slow Python signing
         user_balance = max(self._bankroll_cache, round(size_shares, 4) * 0.02)
         args = MarketOrderArgsV2(
-            token_id=token_id,
-            amount=round(size_shares, 4),
-            side=SELL,
-            user_usdc_balance=user_balance,
+            token_id=token_id, amount=round(size_shares, 4), side=SELL,
+            price=worst_price, user_usdc_balance=user_balance,
         )
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
-
-        # Pre-sign before caller's wait_for() timeout (see place_market_buy).
-        _t_sign = time.monotonic()
-        signed = await asyncio.to_thread(
-            self.client.create_market_order, order_args=args, options=options
-        )
-        sign_ms = (time.monotonic() - _t_sign) * 1000
-
-        # Cache locals — same rationale as place_market_buy.
-        _client = self.client
-        _poly_addr = self._poly_addr
-        _api_key = self._clob_api_key
-        _debug = _DEBUG_ENABLED
-        _rust_pool = self._rust_pool
-        _rust_creds = self._rust_creds
-
-        def _post() -> Any:
-            if _debug:
-                log.debug(
-                    f"[clob.diag] SELL post sig=3 funder={_poly_addr[:10]} "
-                    f"signer={getattr(signed, 'signer', '?')[:10]} "
-                    f"signed.builder={str(getattr(signed, 'builder', BYTES32_ZERO))[:10]} "
-                    f"api_key={_api_key[:8]} "
-                    f"neg_risk={neg_risk} tick={tick_size} sign_ms={sign_ms:.1f}"
-                )
-            if _rust_pool and _rust_creds:
-                import orjson
-                from py_clob_client_v2.client import order_to_json_v2
-                payload = order_to_json_v2(signed, _api_key, OrderType.FAK, False, False)
-                body_str = orjson.dumps(payload).decode("utf-8")
-                resp_str = _rust_pool.post_order(body_str, _rust_creds)
-                # FORCE LOG FOR DEBUGGING
-                log.warning(f"[clob.diag] SELL HFT post resp={resp_str[:300]}")
-                return orjson.loads(resp_str)
-            else:
-                return _client.post_order(signed, OrderType.FAK)
-
-        _t_post = time.monotonic()
-        resp = await asyncio.to_thread(_post)
-        post_ms = (time.monotonic() - _t_post) * 1000
-        if isinstance(resp, dict):
-            resp.setdefault("_sign_ms", sign_ms)
-            resp.setdefault("_post_ms", post_ms)
-            return resp
-        return {"raw": resp, "_sign_ms": sign_ms, "_post_ms": post_ms}
+        signed = await asyncio.to_thread(self.client.create_market_order, order_args=args, options=options)
+        resp = await asyncio.to_thread(self.client.post_order, signed, OrderType.FAK)
+        return resp if isinstance(resp, dict) else {"raw": resp}

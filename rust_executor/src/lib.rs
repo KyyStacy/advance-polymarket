@@ -112,6 +112,15 @@ impl RustHttpPool {
         });
     }
 
+    fn heartbeat(&self, py: Python<'_>, creds: &RustApiCreds) {
+        let pool = Arc::clone(&self.pool);
+        let inner_creds = creds.inner.clone();
+        let signer = creds.signer_address.clone();
+        py.allow_threads(|| {
+            TOKIO_RT.block_on(async move { pool.heartbeat(&inner_creds, &signer).await });
+        });
+    }
+
     /// Complete HFT flow: Sign EIP-1271 order and POST in Rust
     #[allow(clippy::too_many_arguments)]
     fn sign_and_post_order(
