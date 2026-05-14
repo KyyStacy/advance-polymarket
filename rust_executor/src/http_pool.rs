@@ -95,10 +95,13 @@ impl HttpPool {
 
         match req.send().await {
             Ok(resp) => resp.text().await,
-            Err(e) if e.is_connect() || e.is_timeout() => {
-                // If it's a connection error (e.g. idle connection was dropped),
+            Err(e) if e.is_connect() => {
+                // If it's a connection error (e.g. idle connection was dropped or refused),
                 // retry ONCE with a fresh request. Reqwest will handle opening
                 // a new connection in its pool.
+                // WE DO NOT RETRY TIMEOUTS! A POST timeout means the server might have
+                // received and processed the order. Retrying takes another 2.2s, which
+                // breaks Python's 2.5s deadline and causes ghost fills.
                 let auth2 = build_auth_headers(creds, signer_address, path, order_body);
                 let mut req2 = self.client.post(&url).body(order_body.to_owned());
                 req2 = req2.header("Content-Type", "application/json");

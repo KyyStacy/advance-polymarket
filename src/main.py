@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from .config.settings import Settings, load_settings
-from .execution.order_executor import ENTRY_MAX_DRIFT, OrderExecutor
+from .execution.order_executor import OrderExecutor
 from .execution.position_tracker import Position, PositionTracker
 from .feeds.binance_ws import BinanceFeed
 from .feeds.coinbase_ws import CoinbaseFeed
@@ -42,10 +42,18 @@ class TradingBot:
 
         self.agg = PriceAggregator()
 
-        self.binance = BinanceFeed(self.agg.on_cex)
-        self.coinbase = CoinbaseFeed(self.agg.on_cex)
+        def _on_cex_update(exchange: str, symbol: str, price: float, ts: float) -> None:
+            self.agg.on_cex(exchange, symbol, price, ts)
+            self._tick_event.set()
+
+        self.binance = BinanceFeed(_on_cex_update)
+        self.coinbase = CoinbaseFeed(_on_cex_update)
+        def _on_oracle_update(ts: float, price: float, upd: int) -> None:
+            self.agg.on_oracle(ts, price, upd)
+            self._tick_event.set()
+
         self.oracle = PolymarketRtdsFeed(
-            on_update=self.agg.on_oracle,
+            on_update=_on_oracle_update,
             symbol="btc/usd",
         )
 
@@ -63,7 +71,11 @@ class TradingBot:
 
         self.momentum = MomentumAnalyzer(self.agg)
         self.leadlag = LeadLagDetector(self.agg)
-        self.mispricing = MispricingEvaluator()
+        self.mispricing = MispricingEvaluator(
+            sigma_per_sec=self.s.sig_sigma_per_sec,
+            momentum_drift_weight=self.s.sig_momentum_drift_weight,
+            leadlag_drift_weight_per_bp=self.s.sig_leadlag_drift_weight_per_bp,
+        )
 
         self.entry_engine = EntryEngine(self.s)
         self.exit_engine = ExitEngine(self.s)
@@ -344,11 +356,11 @@ class TradingBot:
                 ed.reason = "latched-exit-retry"
                 
             if ed.exit:
-                # Throttle: if sell just failed, wait 1s before retrying to avoid
-                # 50ms-tick spam. 6 internal retries × ~300ms each ≈ 1.8s per call;
-                # external throttle caps retry rate to ~1/s when internal loop exhausts.
+                # Throttle: if sell just failed, wait 200ms before retrying to avoid
+                # API spam, but aggressive enough to punch through a crashing market
+                # where liquidity is disappearing rapidly.
                 now_ts = time.time()
-                sell_cooldown_ok = (now_ts - self._last_sell_fail_ts) >= 1.0
+                sell_cooldown_ok = (now_ts - self._last_sell_fail_ts) >= 0.2
                 if not sell_cooldown_ok:
                     return
                 self.log.info(
@@ -369,19 +381,32 @@ class TradingBot:
                             f"[bot] rapid-flip detected (held={seconds_held:.0f}s<{self._rapid_flip_hold_sec:.0f}s) "
                             f"— blocking entries for {self._rapid_flip_cooldown_sec:.0f}s"
                         )
-                    if self.positions.closed:
-                        pnl = self.positions.closed[-1].realized_pnl
-                        self.risk.record_trade_pnl(pnl)
-                        if pnl < 0:
-                            self._consecutive_losses += 1
-                            if self._consecutive_losses >= 2 and not self._window_trading_stopped:
-                                self._window_trading_stopped = True
-                                self.log.warning(
-                                    f"[bot] {self._consecutive_losses} consecutive losses "
-                                    "— stopping new entries for this window"
-                                )
-                        else:
-                            self._consecutive_losses = 0
+                    # BUG FIX: Do NOT read realized_pnl from positions.closed[-1].
+                    # closed[-1] may be a DIFFERENT position (from a prior window) if
+                    # the async reconcile task raced ahead. Use sell.avg_price and
+                    # existing.entry_price which we captured BEFORE the await.
+                    actual_exit = sell.avg_price if sell.avg_price > 0 else mark
+                    pnl = (actual_exit - existing.entry_price) * existing.size_shares
+                    self.risk.record_trade_pnl(pnl)
+                    if pnl < 0:
+                        self._consecutive_losses += 1
+                        self.log.info(
+                            f"[bot] TRADE RESULT {existing.side} entry={existing.entry_price:.3f} "
+                            f"exit={actual_exit:.3f} pnl={pnl:+.4f} — LOSS "
+                            f"(consecutive={self._consecutive_losses})"
+                        )
+                        if self._consecutive_losses >= 2 and not self._window_trading_stopped:
+                            self._window_trading_stopped = True
+                            self.log.warning(
+                                f"[bot] {self._consecutive_losses} consecutive losses "
+                                "— stopping new entries for this window"
+                            )
+                    else:
+                        self._consecutive_losses = 0
+                        self.log.info(
+                            f"[bot] TRADE RESULT {existing.side} entry={existing.entry_price:.3f} "
+                            f"exit={actual_exit:.3f} pnl={pnl:+.4f} — WIN"
+                        )
                 else:
                     self._last_sell_fail_ts = time.time()
                     reason = sell.error or "unknown"
@@ -484,7 +509,7 @@ class TradingBot:
                 self.log.info(f"[bot] entry aborted — fresh ask gone for {decision.side}")
             return
         ask_drift = fresh_ask - decision_ask
-        if ask_drift > ENTRY_MAX_DRIFT:
+        if ask_drift > self.s.exec_max_drift:
             abort_key = f"ask-drift:{decision.side}:{fresh_ask:.3f}"
             if abort_key != self._last_abort_key:
                 self._last_abort_key = abort_key

@@ -89,6 +89,53 @@ class Settings:
     entry_window_end_sec: int
     exit_hard_floor_sec: int
 
+    # Signal Logic
+    sig_sigma_per_sec: float
+    sig_momentum_drift_weight: float
+    sig_leadlag_drift_weight_per_bp: float
+
+    # Entry Engine
+    entry_min_exit_bid: float
+    entry_max_spread: float
+
+    # Exit Engine
+    exit_stale_seconds: float
+    exit_min_hold_seconds: float
+    exit_own_fill_grace_seconds: float
+    exit_take_profit_pct: float
+    exit_trailing_stop_min_peak: float
+    exit_trailing_stop_dist: float
+    exit_profit_hold_pct: float
+    exit_loss_exit_z: float
+    exit_z_in_profit: float
+    exit_edge_collapse_loss_frac: float
+    exit_edge_collapse_profit_frac: float
+    exit_ll_converge_loss_frac: float
+    exit_ll_converge_profit_frac: float
+    exit_ll_min_adverse_z: float
+    exit_ll_min_loss_pct: float
+    exit_hard_stop_loss_pct: float
+
+    # Order Execution
+    exec_order_fail_cooldown_sec: float
+    exec_fill_poll_deadline_sec: float
+    exec_fill_poll_interval_sec: float
+    exec_fill_poll_fast_sec: float
+    exec_fill_poll_fast_window_sec: float
+    exec_fill_poll_backoff_mult: float
+    exec_fill_poll_max_sec: float
+    exec_balance_delta_epsilon: float
+    exec_max_drift: float
+    exec_signal_anchor_ttl_sec: float
+    exec_buy_total_deadline_sec: float
+    exec_buy_api_timeout_sec: float
+    exec_sell_max_attempts: int
+    exec_sell_retry_delay_sec: float
+    exec_sell_api_timeout_sec: float
+    exec_sell_fill_poll_deadline_sec: float
+    exec_min_sell_usd: float
+    exec_post_sell_guard_sec: float
+
     # Logging
     log_level: str
     log_file: str
@@ -145,6 +192,53 @@ def load_settings(env_path: str | None = None) -> Settings:
         entry_window_start_sec=_envi("ENTRY_WINDOW_START_SEC", 60),
         entry_window_end_sec=_envi("ENTRY_WINDOW_END_SEC", 270),
         exit_hard_floor_sec=_envi("EXIT_HARD_FLOOR_SEC", 15),
+
+        # Signal Logic
+        sig_sigma_per_sec=_envf("SIG_SIGMA_PER_SEC", 0.00006),
+        sig_momentum_drift_weight=_envf("SIG_MOMENTUM_DRIFT_WEIGHT", 0.0008),
+        sig_leadlag_drift_weight_per_bp=_envf("SIG_LEADLAG_DRIFT_WEIGHT_PER_BP", 0.0002),
+        
+        # Entry Engine
+        entry_min_exit_bid=_envf("ENTRY_MIN_EXIT_BID", 0.05),
+        entry_max_spread=_envf("ENTRY_MAX_SPREAD", 0.15),
+
+        # Exit Engine
+        exit_stale_seconds=_envf("EXIT_STALE_SECONDS", 10.0),
+        exit_min_hold_seconds=_envf("EXIT_MIN_HOLD_SECONDS", 5.0),
+        exit_own_fill_grace_seconds=_envf("EXIT_OWN_FILL_GRACE_SECONDS", 1.0),
+        exit_take_profit_pct=_envf("EXIT_TAKE_PROFIT_PCT", 3.00),
+        exit_trailing_stop_min_peak=_envf("EXIT_TRAILING_STOP_MIN_PEAK", 0.20),
+        exit_trailing_stop_dist=_envf("EXIT_TRAILING_STOP_DIST", 0.10),
+        exit_profit_hold_pct=_envf("EXIT_PROFIT_HOLD_PCT", 0.05),
+        exit_loss_exit_z=_envf("EXIT_LOSS_EXIT_Z", 1.5),
+        exit_z_in_profit=_envf("EXIT_Z_IN_PROFIT", 1.8),
+        exit_edge_collapse_loss_frac=_envf("EXIT_EDGE_COLLAPSE_LOSS_FRAC", 0.3333),
+        exit_edge_collapse_profit_frac=_envf("EXIT_EDGE_COLLAPSE_PROFIT_FRAC", 0.0),
+        exit_ll_converge_loss_frac=_envf("EXIT_LL_CONVERGE_LOSS_FRAC", -0.25),
+        exit_ll_converge_profit_frac=_envf("EXIT_LL_CONVERGE_PROFIT_FRAC", -0.50),
+        exit_ll_min_adverse_z=_envf("EXIT_LL_MIN_ADVERSE_Z", 1.0),
+        exit_ll_min_loss_pct=_envf("EXIT_LL_MIN_LOSS_PCT", -0.15),
+        exit_hard_stop_loss_pct=_envf("EXIT_HARD_STOP_LOSS_PCT", -0.40),
+
+        # Order Execution
+        exec_order_fail_cooldown_sec=_envf("EXEC_ORDER_FAIL_COOLDOWN_SEC", 5.0),
+        exec_fill_poll_deadline_sec=_envf("EXEC_FILL_POLL_DEADLINE_SEC", 10.0),
+        exec_fill_poll_interval_sec=_envf("EXEC_FILL_POLL_INTERVAL_SEC", 0.25),
+        exec_fill_poll_fast_sec=_envf("EXEC_FILL_POLL_FAST_SEC", 0.025),
+        exec_fill_poll_fast_window_sec=_envf("EXEC_FILL_POLL_FAST_WINDOW_SEC", 2.0),
+        exec_fill_poll_backoff_mult=_envf("EXEC_FILL_POLL_BACKOFF_MULT", 1.5),
+        exec_fill_poll_max_sec=_envf("EXEC_FILL_POLL_MAX_SEC", 0.25),
+        exec_balance_delta_epsilon=_envf("EXEC_BALANCE_DELTA_EPSILON", 0.005),
+        exec_max_drift=_envf("EXEC_MAX_DRIFT", 0.03),
+        exec_signal_anchor_ttl_sec=_envf("EXEC_SIGNAL_ANCHOR_TTL_SEC", 30.0),
+        exec_buy_total_deadline_sec=_envf("EXEC_BUY_TOTAL_DEADLINE_SEC", 3.0),
+        exec_buy_api_timeout_sec=_envf("EXEC_BUY_API_TIMEOUT_SEC", 2.5),
+        exec_sell_max_attempts=_envi("EXEC_SELL_MAX_ATTEMPTS", 3),
+        exec_sell_retry_delay_sec=_envf("EXEC_SELL_RETRY_DELAY_SEC", 0.02),
+        exec_sell_api_timeout_sec=_envf("EXEC_SELL_API_TIMEOUT_SEC", 2.5),
+        exec_sell_fill_poll_deadline_sec=_envf("EXEC_SELL_FILL_POLL_DEADLINE_SEC", 20.0),
+        exec_min_sell_usd=_envf("EXEC_MIN_SELL_USD", 0.05),
+        exec_post_sell_guard_sec=_envf("EXEC_POST_SELL_GUARD_SEC", 5.0),
         log_level=_env("LOG_LEVEL", "INFO"),
         log_file=_env("LOG_FILE", "logs/bot.log"),
         project_root=root,

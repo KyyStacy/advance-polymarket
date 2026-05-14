@@ -16,79 +16,6 @@ class ExitDecision:
 
 
 class ExitEngine:
-    """Asymmetric signal-based exit. Hold winners; cut losers fast.
-
-    Philosophy: maximize EV, not quick wins. A reversal in our direction is
-    cheap to ride (we already have profit cushion); a reversal against us
-    compounds losses every tick. So thresholds differ by P&L state.
-
-    Exit triggers (any one):
-      - Time floor before resolution (always — bypasses min hold)
-      - Book stale > STALE_EXIT_SECONDS (Polymarket WS dead — bypasses min hold)
-      - Take-profit >= TAKE_PROFIT_PCT (bypasses min hold — lock in big wins)
-      - Trailing stop: peak >= TRAILING_STOP_MIN_PEAK and drop >= TRAILING_STOP_DIST
-      - Side flip (model fully disagrees — bypasses min hold)
-      - After MIN_HOLD_SECONDS only:
-        - In-loss + adverse momentum z >= LOSS_EXIT_Z
-        - In-profit + EXTREME adverse signal (only confirmed reversal)
-        - Edge collapse / lead-lag convergence
-    """
-
-    # 30s was too permissive — Polymarket book heartbeats every 2–5s, so a
-    # 10s silence almost always means a real disconnect, not a normal pause.
-    # Tighter threshold triggers stale-exit 3× faster on actual feed loss.
-    STALE_EXIT_SECONDS = 10.0
-    # Minimum hold time after entry before signal-based exits can fire.
-    # Reduced 45→30s: most losing trades show clear reversal within 15-30s.
-    # Tighter floor means we cut confirmed losses faster instead of waiting.
-    MIN_HOLD_SECONDS = 30.0
-    # Hard floor against own-fill adverse selection: own market buy moves the
-    # ask and immediately tilts the fair-probability estimate against us. Side
-    # flip / take-profit can otherwise fire on the same tick as the fill and
-    # lock in 50–200bps loss before the market has even acked our trade.
-    # This window is tiny (1s) but enough for the book to settle post-fill.
-    OWN_FILL_GRACE_SECONDS = 1.0
-    # Hard take-profit: only at extreme gains (300%) as a safety ceiling.
-    # Primary profit-protection is the trailing stop below — this hard cap
-    # is intentionally high so 150-200% runs are not cut prematurely.
-    TAKE_PROFIT_PCT = 3.00
-    # Trailing stop: once peak unrealized >= TRAILING_STOP_MIN_PEAK,
-    # exit if current unrealized drops TRAILING_STOP_DIST from the peak.
-    # Raised to 40%/30pp: Polymarket thin books have wide bid-ask spreads
-    # causing noisy bid prints that false-fire trailing stops too early.
-    # Requires a more sustained profit peak before activating protection.
-    TRAILING_STOP_MIN_PEAK = 0.40
-    TRAILING_STOP_DIST = 0.30
-    # P&L threshold separating "cut fast" vs "let it run" regimes
-    PROFIT_HOLD_PCT = 0.10
-    # Loss-regime adverse z floor. Should be >= entry threshold
-    # (MIN_MOMENTUM_Z, default 2.0) so noise reversion doesn't trigger exit.
-    LOSS_EXIT_Z = 2.0
-    # Higher z required to exit while sitting in profit
-    Z_EXIT_IN_PROFIT = 2.5
-    # Edge collapse: in profit, allow much more decay before exit
-    EDGE_COLLAPSE_LOSS_FRAC = 1.0 / 3.0      # cut in loss when edge < min/3
-    EDGE_COLLAPSE_PROFIT_FRAC = 0.0          # in profit, only exit when edge actually negative
-    # Lead-lag exit only when signal has clearly REVERSED, not merely converged.
-    # Earlier setting (0.25 in loss) cut profitable trades on minor positive
-    # signal weakening (e.g. 0.4bps<0.5 floor) while plenty of window remained.
-    # Now require leadlag to be at least min_leadlag * frac BELOW zero (negative
-    # for our side), and additionally require adverse momentum confirmation so a
-    # single noisy signal alone never triggers exit.
-    LEADLAG_CONVERGE_LOSS_FRAC = -0.25       # ~ -0.5bps before considered "flipped" in loss
-    LEADLAG_CONVERGE_PROFIT_FRAC = -0.5      # ~ -1.0bps before considered "flipped" in profit
-    # Minimum momentum z (in adverse direction) required to confirm leadlag-flip exit.
-    # Without this, a single weak signal could close a winning thesis prematurely.
-    LEADLAG_EXIT_MIN_ADVERSE_Z = 1.0
-    # When loss is mild and time remains, hold even on signal weakness.
-    # Prevents cutting on noise reversion that hasn't reached real conviction.
-    LEADLAG_EXIT_MIN_LOSS_PCT = -0.15        # only consider leadlag exit if loss > 15%
-
-    # Hard stop loss to prevent full wipes on runaway markets.
-    # If a position drops 40%, cut it immediately regardless of signal state.
-    # Prevents holding -95% positions just because z-score dipped from 2.01 to 1.99.
-    HARD_STOP_LOSS_PCT = -0.40
-
     def __init__(self, settings: Settings):
         self.s = settings
         self._last_mispricing_ts: float = time.time()  # init to now so first ticks get a grace period
@@ -109,14 +36,14 @@ class ExitEngine:
             return ExitDecision(True, f"time-floor<={self.s.exit_hard_floor_sec}s")
 
         # Hard stop-loss — unconditionally cut deep losers
-        if unrealized_pct <= self.HARD_STOP_LOSS_PCT:
-            return ExitDecision(True, f"hard-stop-loss unreal={unrealized_pct:+.1%}<={self.HARD_STOP_LOSS_PCT:+.1%}")
+        if unrealized_pct <= self.s.exit_hard_stop_loss_pct:
+            return ExitDecision(True, f"hard-stop-loss unreal={unrealized_pct:+.1%}<={self.s.exit_hard_stop_loss_pct:+.1%}")
 
         now = time.time()
         if mispricing is None:
             stale_for = now - self._last_mispricing_ts if self._last_mispricing_ts else 9999.0
-            if stale_for > self.STALE_EXIT_SECONDS:
-                return ExitDecision(True, f"book-stale>{self.STALE_EXIT_SECONDS:.0f}s")
+            if stale_for > self.s.exit_stale_seconds:
+                return ExitDecision(True, f"book-stale>{self.s.exit_stale_seconds:.0f}s")
             return ExitDecision(False, "no-mispricing-data-yet")
         self._last_mispricing_ts = now
 
@@ -124,25 +51,25 @@ class ExitEngine:
         # entry. Only time-floor (above) bypasses this — book-stale and signal
         # exits all wait for the book to settle. Prevents adverse selection
         # from our own market buy snapping fair_p_up against us instantly.
-        if seconds_held < self.OWN_FILL_GRACE_SECONDS:
+        if seconds_held < self.s.exit_own_fill_grace_seconds:
             return ExitDecision(
                 False,
-                f"hold[own-fill-grace] {seconds_held:.2f}s<{self.OWN_FILL_GRACE_SECONDS:.1f}s"
+                f"hold[own-fill-grace] {seconds_held:.2f}s<{self.s.exit_own_fill_grace_seconds:.1f}s"
             )
 
-        in_profit = unrealized_pct >= self.PROFIT_HOLD_PCT
+        in_profit = unrealized_pct >= self.s.exit_profit_hold_pct
 
         # Take-profit: lock in large gains immediately (bypasses min hold)
-        if unrealized_pct >= self.TAKE_PROFIT_PCT:
+        if unrealized_pct >= self.s.exit_take_profit_pct:
             return ExitDecision(True, f"take-profit unreal={unrealized_pct:+.1%}")
 
-        # Trailing stop: once peak >= 40%, exit if dropped 30pp from peak (bypasses min hold)
-        if peak_unreal >= self.TRAILING_STOP_MIN_PEAK:
+        # Trailing stop: once peak >= 40%, exit if dropped 10pp from peak (bypasses min hold)
+        if peak_unreal >= self.s.exit_trailing_stop_min_peak:
             drawdown = peak_unreal - unrealized_pct
-            if drawdown >= self.TRAILING_STOP_DIST:
+            if drawdown >= self.s.exit_trailing_stop_dist:
                 return ExitDecision(
                     True,
-                    f"trailing-stop peak={peak_unreal:+.1%} drop={drawdown:.1%}>={self.TRAILING_STOP_DIST:.1%}"
+                    f"trailing-stop peak={peak_unreal:+.1%} drop={drawdown:.1%}>={self.s.exit_trailing_stop_dist:.1%}"
                 )
 
         # Side flip — model fully disagrees. Always exit (bypasses min hold).
@@ -151,10 +78,10 @@ class ExitEngine:
 
         # Min hold time — block signal-based exits during initial settle period.
         # Time-floor, book-stale, and side-flip above already bypassed this.
-        if seconds_held < self.MIN_HOLD_SECONDS:
+        if seconds_held < self.s.exit_min_hold_seconds:
             return ExitDecision(
                 False,
-                f"hold[settling] {seconds_held:.0f}s<{self.MIN_HOLD_SECONDS:.0f}s "
+                f"hold[settling] {seconds_held:.0f}s<{self.s.exit_min_hold_seconds:.0f}s "
                 f"unreal={unrealized_pct:+.1%}"
             )
 
@@ -164,7 +91,7 @@ class ExitEngine:
         else:
             adverse = momentum.direction == 1
         if adverse:
-            z_threshold = self.Z_EXIT_IN_PROFIT if in_profit else self.LOSS_EXIT_Z
+            z_threshold = self.s.exit_z_in_profit if in_profit else self.s.exit_loss_exit_z
             if momentum.z_score >= z_threshold:
                 regime = "profit" if in_profit else "loss"
                 return ExitDecision(
@@ -175,8 +102,8 @@ class ExitEngine:
 
         # Edge collapse — different tolerance based on P&L
         edge_floor = (
-            self.s.min_edge * self.EDGE_COLLAPSE_PROFIT_FRAC if in_profit
-            else self.s.min_edge * self.EDGE_COLLAPSE_LOSS_FRAC
+            self.s.min_edge * self.s.exit_edge_collapse_profit_frac if in_profit
+            else self.s.min_edge * self.s.exit_edge_collapse_loss_frac
         )
         if mispricing.edge < edge_floor:
             regime = "profit" if in_profit else "loss"
@@ -196,8 +123,8 @@ class ExitEngine:
         if leadlag is not None:
             signed = leadlag.deviation_bps if side == "UP" else -leadlag.deviation_bps
             ll_floor = (
-                self.s.min_leadlag_bps * self.LEADLAG_CONVERGE_PROFIT_FRAC if in_profit
-                else self.s.min_leadlag_bps * self.LEADLAG_CONVERGE_LOSS_FRAC
+                self.s.min_leadlag_bps * self.s.exit_ll_converge_profit_frac if in_profit
+                else self.s.min_leadlag_bps * self.s.exit_ll_converge_loss_frac
             )
             if signed < ll_floor:
                 # Confirmation gates
@@ -205,8 +132,8 @@ class ExitEngine:
                     (side == "UP" and momentum.direction == -1)
                     or (side == "DOWN" and momentum.direction == 1)
                 )
-                mom_confirms = adverse_dir and momentum.z_score >= self.LEADLAG_EXIT_MIN_ADVERSE_Z
-                loss_material = in_profit or unrealized_pct <= self.LEADLAG_EXIT_MIN_LOSS_PCT
+                mom_confirms = adverse_dir and momentum.z_score >= self.s.exit_ll_min_adverse_z
+                loss_material = in_profit or unrealized_pct <= self.s.exit_ll_min_loss_pct
                 if mom_confirms and loss_material:
                     regime = "profit" if in_profit else "loss"
                     return ExitDecision(

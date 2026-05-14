@@ -19,13 +19,6 @@ class EntryDecision:
 
 
 class EntryEngine:
-    # Liquidity gates — a position with no viable exit is a guaranteed loss.
-    # MIN_EXIT_BID: must be possible to sell at >= this price to hand over the
-    # position. 0.05 = if no bidder is even at 5¢, the market is too thin.
-    # MAX_SPREAD: ask - bid must be reasonable. >15¢ implies one-sided book.
-    MIN_EXIT_BID = 0.05
-    MAX_SPREAD = 0.15
-
     def __init__(self, settings: Settings):
         self.s = settings
 
@@ -70,13 +63,13 @@ class EntryEngine:
         if implied_bid is None or implied_bid <= 0:
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
                                  "no-exit-bid")
-        if implied_bid < self.MIN_EXIT_BID:
+        if implied_bid < self.s.entry_min_exit_bid:
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
-                                 f"thin-bid={implied_bid:.3f}<{self.MIN_EXIT_BID}")
+                                 f"thin-bid={implied_bid:.3f}<{self.s.entry_min_exit_bid}")
         spread = implied_ask - implied_bid
-        if spread > self.MAX_SPREAD:
+        if spread > self.s.entry_max_spread:
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
-                                 f"spread-too-wide={spread:.3f}>{self.MAX_SPREAD}")
+                                 f"spread-too-wide={spread:.3f}>{self.s.entry_max_spread}")
 
         # Direction confirmation: momentum must agree with chosen side (UP needs +, DOWN -)
         if side == "UP" and momentum.direction != 1:
@@ -141,5 +134,23 @@ class EntryEngine:
         if mispricing.edge < self.s.min_edge:
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
                                  f"edge<{self.s.min_edge:.2f}")
+
+        # Momentum Velocity: ensure short-term (30s) momentum hasn't completely
+        # died out compared to the 60s average. This is more lenient than
+        # acceleration but still catches late entries.
+        ret30 = momentum.return_30s if side == "UP" else -momentum.return_30s
+        ret60 = momentum.return_60s if side == "UP" else -momentum.return_60s
+        if ret30 < ret60 * 0.40:
+             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
+                                  f"momentum-velocity-low 30s={ret30:.6f} vs 60s={ret60:.6f}")
+
+
+        # High-odds quality gate: for trades at ask > 0.70, upside is capped.
+        # Require lead-lag to be stronger than baseline.
+        if implied_ask > 0.70 and leadlag is not None:
+             ll_signed = leadlag.deviation_bps if side == "UP" else -leadlag.deviation_bps
+             if ll_signed < self.s.min_leadlag_bps * 1.5:
+                  return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
+                                       f"high-odds-ll-weak ask={implied_ask:.2f} ll={ll_signed:.1f}bps")
 
         return EntryDecision(True, side, token_id, implied_ask, mispricing.edge, "ok")

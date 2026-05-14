@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import datetime
 import sys
 from pathlib import Path
 
-from loguru import logger
+from loguru import logger as _logger
+
+
+def _utc7_patcher(record):
+    """Inject a pre-formatted UTC+7 timestamp into the record."""
+    utc7_now = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=7))
+    )
+    record["extra"]["utc7_time"] = utc7_now.strftime("%H:%M:%S.%f")[:-3]
+
+
+logger = _logger.patch(_utc7_patcher)
 
 
 _configured = False
@@ -19,7 +31,7 @@ def setup_logger(level: str = "INFO", log_file: str | None = None, console: bool
             sys.stderr,
             level=level.upper(),
             format=(
-                "<green>{time:HH:mm:ss.SSS}</green> "
+                "<green>{extra[utc7_time]}</green> "
                 "<level>{level: <7}</level> "
                 "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
                 "<level>{message}</level>"
@@ -30,7 +42,7 @@ def setup_logger(level: str = "INFO", log_file: str | None = None, console: bool
         )
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        # Exclude [signal] logs from main log file — they go to signals.log only
+
         def exclude_signal_filter(record):
             return "[signal]" not in record["message"]
 
@@ -40,7 +52,7 @@ def setup_logger(level: str = "INFO", log_file: str | None = None, console: bool
             rotation="20 MB",
             retention="14 days",
             format=(
-                "<green>{time:HH:mm:ss.SSS}</green> "
+                "<green>{extra[utc7_time]}</green> "
                 "<level>{level: <7}</level> "
                 "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
                 "<level>{message}</level>"
@@ -72,7 +84,7 @@ def _setup_signal_logger(log_file: str | None) -> None:
         level="INFO",
         rotation="20 MB",
         retention="14 days",
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {message}",
+        format="{extra[utc7_time]} | {message}",
         filter=signal_filter,
         enqueue=True,
         backtrace=False,

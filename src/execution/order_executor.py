@@ -13,76 +13,6 @@ from .position_tracker import Position, PositionTracker
 
 log = get_logger()
 
-# Cooldown after a real (non-transient) order failure
-_ORDER_FAIL_COOLDOWN_SEC = 5.0
-# How long to poll Polymarket balances waiting for fill settlement.
-# POLY_1271 deposit wallet settlement is typically 1–4s on Polygon; 10s gives
-# generous headroom for relayer congestion without prematurely falling back to
-# response-parsed estimates that may mask the true fill price.
-_FILL_POLL_DEADLINE_SEC = 10.0
-_FILL_POLL_INTERVAL_SEC = 0.25
-# Fast polling: Gnosis Safe relay can land a fill in 200–600ms, so the first
-# checks should be aggressive. Tighter initial poll (50ms) + exponential
-# backoff catches quick fills 50–100ms faster than the previous flat 100ms.
-# Tighter initial poll: Gnosis Safe relay typically responds within 200–600ms.
-# 25ms first check catches quick fills ~25ms faster than previous 50ms.
-_FILL_POLL_FAST_SEC = 0.025
-_FILL_POLL_FAST_WINDOW_SEC = 2.0
-_FILL_POLL_BACKOFF_MULT = 1.5
-_FILL_POLL_MAX_SEC = 0.25
-# Minimum balance change considered a real fill (filters out dust noise)
-_BALANCE_DELTA_EPSILON = 0.005
-# Max ask drift (absolute USD) validated in main.py before calling buy_to_open.
-# Kept here as a named constant so entry_engine / main.py can import it as
-# the single source of truth for the drift gate threshold.
-# Adjusted to 0.03: Balances protection against massive slippage while
-# allowing enough room for fills in typically thin Polymarket order books.
-ENTRY_MAX_DRIFT = 0.03
-# Hard cap on how far the ask can drift FROM THE ORIGINAL SIGNAL across an
-# entire entry attempt sequence (across multiple buy_to_open calls within the
-# same window+side). Must equal ENTRY_MAX_DRIFT so the cascade gate and the
-# per-call gate enforce the same absolute ceiling (first_ask + ENTRY_MAX_DRIFT).
-ENTRY_MAX_CASCADE_DRIFT = ENTRY_MAX_DRIFT
-# Forget the signal anchor after this many seconds of inactivity (allows fresh
-# entries after the book settles or moves back toward the original signal).
-ENTRY_SIGNAL_ANCHOR_TTL_SEC = 30.0
-# BUY total budget: Rust pool timeout (2.2s) + ghost-fill poll (0.5s) + margin (0.3s) = 3.0s.
-# Reduced from 3.5s: Rust pool now has 2.2s per-request timeout which covers P99 (~2.3s)
-# without Python needing an extra generous buffer.
-_BUY_TOTAL_DEADLINE_SEC = 3.0
-_SELL_MAX_ATTEMPTS = 3
-_SELL_RETRY_DELAY_SEC = 0.020  # 20 ms — let book briefly re-quote between attempts
-# Reduced from 6→2 attempts: when attempt #1 FAK kills at worst_price, an instant
-# retry hits the same empty book and kills too. Better to give up fast and let
-# exit_engine fire again ~50ms later with a fresh mark_price (and possibly fresh
-# book depth). Total sell budget: ~3s worst-case vs 12s previously.
-# Polymarket POST P50 ~150–250ms, P99 ~500ms. Cutting from 1.5s → 0.6s
-# saves up to ~1s per dead attempt while keeping a 2× safety margin over P99.
-# Increased 1.2→2.0s: Rust HFT path adds signing time (ECDSA) on top of network;
-# Polymarket SELL P99 can hit 1.5s during congestion. 2.0s = 1.33× P99 buffer.
-_SELL_API_TIMEOUT_SEC = 2.0
-# Sell reconciliation deadline. Kept at 20s as a conservative cap covering
-# slow-relayer settlement on POLY_1271 deposit wallets.
-_SELL_FILL_POLL_DEADLINE_SEC = 20.0
-# Increased 1.5→2.5s: ~30% of buy orders are landing late ("Duplicated" errors
-# = order succeeded but response arrived after our 1.5s cutoff, triggering retry).
-# 2.5s matches the observed P99 latency of ~2.3s for successful fills.
-# This DIRECTLY fixes the ~72% timeout rate observed in the session.
-_BUY_API_TIMEOUT_SEC = 2.5
-# Minimum USD value for a sell order to be worth attempting.
-# Polymarket rejects orders where maker or taker amount is 0; small shares
-# at low prices (e.g. 0.006sh × 0.09 = $0.0005) always fail. Use 5¢ as
-# a safe floor — anything below this is a ghost position and should be cleared.
-_MIN_SELL_USD = 0.05
-# How long to block re-buy on the same token after a sell.
-# From bot.log analysis: Gnosis Safe on-chain confirmation arrives in ~1.5-2s
-# (not 15-20s — that was the reconciliation *timeout*, not actual settlement).
-# 5s provides a 2.5x safety margin over the observed maximum. Re-buying faster
-# creates a double-position: bg_reconcile captures pre_token=0, then sees
-# old+new tokens in delta and inflates size.
-_POST_SELL_GUARD_SEC = 5.0
-
-
 @dataclass
 class FillReport:
     success: bool
@@ -194,7 +124,7 @@ class OrderExecutor:
         return dict(self._counters)
 
     def in_cooldown(self) -> bool:
-        return (time.time() - self._last_fail_ts) < _ORDER_FAIL_COOLDOWN_SEC
+        return (time.time() - self._last_fail_ts) < self.s.exec_order_fail_cooldown_sec
 
     # ------------------------------------------------------------ signal anchor
     def check_signal_anchor(
@@ -216,7 +146,7 @@ class OrderExecutor:
         anchor = self._entry_signal_anchor.get(key)
         if anchor is not None:
             anchor_ask, anchor_ts = anchor
-            if (now - anchor_ts) > ENTRY_SIGNAL_ANCHOR_TTL_SEC:
+            if (now - anchor_ts) > self.s.exec_signal_anchor_ttl_sec:
                 anchor = None
                 self._entry_signal_anchor.pop(key, None)
         if anchor is None:
@@ -224,10 +154,10 @@ class OrderExecutor:
             return True, "anchor-set", current_ask
         anchor_ask, _ = anchor
         drift = current_ask - anchor_ask
-        if drift > ENTRY_MAX_CASCADE_DRIFT:
+        if drift > self.s.exec_max_drift:
             return False, (
                 f"cascade-drift ${drift:+.4f} from anchor ${anchor_ask:.3f} "
-                f"exceeds ${ENTRY_MAX_CASCADE_DRIFT:.4f}"
+                f"exceeds ${self.s.exec_max_drift:.4f}"
             ), anchor_ask
         return True, "within-anchor-drift", anchor_ask
 
@@ -270,13 +200,13 @@ class OrderExecutor:
         means we timed out and the values are estimates — caller should treat
         them as suspicious.
         """
-        deadline = time.monotonic() + _FILL_POLL_DEADLINE_SEC
-        interval = _FILL_POLL_FAST_SEC
+        deadline = time.monotonic() + self.s.exec_fill_poll_deadline_sec
+        interval = self.s.exec_fill_poll_fast_sec
         while time.monotonic() < deadline:
             cur_token = await self._get_token_balance_with_retry(token_id)
             if (
                 cur_token is not None
-                and cur_token > pre_token + _BALANCE_DELTA_EPSILON
+                and cur_token > pre_token + self.s.exec_balance_delta_epsilon
             ):
                 size = cur_token - pre_token
                 cur_pusd = await self.clob.get_usdc_balance()
@@ -287,22 +217,22 @@ class OrderExecutor:
                 avg = cost / size if size > 0 else fallback_cost / max(fallback_size, 1e-6)
                 return size, cost, avg, True
             await asyncio.sleep(interval)
-            interval = min(interval * _FILL_POLL_BACKOFF_MULT, _FILL_POLL_MAX_SEC)
+            interval = min(interval * self.s.exec_fill_poll_backoff_mult, self.s.exec_fill_poll_max_sec)
         # Final read — sometimes the delta lands right after the deadline
         cur_token = await self._get_token_balance_with_retry(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
         if (
             cur_token is not None
-            and cur_token > pre_token + _BALANCE_DELTA_EPSILON
+            and cur_token > pre_token + self.s.exec_balance_delta_epsilon
             and cur_pusd is not None
         ):
             size = cur_token - pre_token
             cost = max(pre_pusd - cur_pusd, 0.0)
             avg = cost / size if size > 0 else fallback_cost / max(fallback_size, 1e-6)
-            log.info(f"[exec] buy reconciled on final read after {_FILL_POLL_DEADLINE_SEC}s")
+            log.info(f"[exec] buy reconciled on final read after {self.s.exec_fill_poll_deadline_sec}s")
             return size, cost, avg, True
         log.warning(
-            f"[exec] BUY NOT RECONCILED within {_FILL_POLL_DEADLINE_SEC}s — "
+            f"[exec] BUY NOT RECONCILED within {self.s.exec_fill_poll_deadline_sec}s — "
             f"logging estimate size={fallback_size:.4f} cost=${fallback_cost:.2f} "
             f"(actual fill may differ; check Polymarket directly)"
         )
@@ -329,42 +259,42 @@ class OrderExecutor:
         if token balance drops but USDC hasn't settled yet, proceeds = 0,
         which would produce a spurious fill_avg of 0.
         """
-        deadline = time.monotonic() + _SELL_FILL_POLL_DEADLINE_SEC
-        interval = _FILL_POLL_FAST_SEC
+        deadline = time.monotonic() + self.s.exec_sell_fill_poll_deadline_sec
+        interval = self.s.exec_fill_poll_fast_sec
         while time.monotonic() < deadline:
             cur_token = await self._get_token_balance_with_retry(token_id)
             if (
                 cur_token is not None
-                and cur_token < pre_token - _BALANCE_DELTA_EPSILON
+                and cur_token < pre_token - self.s.exec_balance_delta_epsilon
             ):
                 cur_pusd = await self.clob.get_usdc_balance()
                 # Require USDC increase too — token can drop before USDC credits
                 # (Gnosis Safe relay lag). Returning with proceeds=0 would produce
                 # fill_avg=0 and corrupt PnL.
-                if cur_pusd is not None and cur_pusd > pre_pusd + _BALANCE_DELTA_EPSILON:
+                if cur_pusd is not None and cur_pusd > pre_pusd + self.s.exec_balance_delta_epsilon:
                     proceeds = cur_pusd - pre_pusd
                     actual_sold = pre_token - cur_token
                     if actual_sold > 0:
                         return proceeds / actual_sold, proceeds, True
                 # else: token dropped but USDC pending — keep polling
             await asyncio.sleep(interval)
-            interval = min(interval * _FILL_POLL_BACKOFF_MULT, _FILL_POLL_MAX_SEC)
+            interval = min(interval * self.s.exec_fill_poll_backoff_mult, self.s.exec_fill_poll_max_sec)
         # Final read — sometimes both deltas land right after the deadline
         cur_token = await self._get_token_balance_with_retry(token_id)
         cur_pusd = await self.clob.get_usdc_balance()
         if (
             cur_token is not None
-            and cur_token < pre_token - _BALANCE_DELTA_EPSILON
+            and cur_token < pre_token - self.s.exec_balance_delta_epsilon
             and cur_pusd is not None
-            and cur_pusd > pre_pusd + _BALANCE_DELTA_EPSILON
+            and cur_pusd > pre_pusd + self.s.exec_balance_delta_epsilon
         ):
             proceeds = cur_pusd - pre_pusd
             actual_sold = pre_token - cur_token
             if actual_sold > 0:
-                log.info(f"[exec] sell reconciled on final read after {_SELL_FILL_POLL_DEADLINE_SEC}s")
+                log.info(f"[exec] sell reconciled on final read after {self.s.exec_sell_fill_poll_deadline_sec}s")
                 return proceeds / actual_sold, proceeds, True
         log.warning(
-            f"[exec] SELL NOT RECONCILED within {_SELL_FILL_POLL_DEADLINE_SEC}s — "
+            f"[exec] SELL NOT RECONCILED within {self.s.exec_sell_fill_poll_deadline_sec}s — "
             f"logging estimate avg={fallback_avg:.4f} (actual fill may differ; "
             "check Polymarket directly)"
         )
@@ -422,6 +352,24 @@ class OrderExecutor:
         except Exception as e:
             log.error(f"[exec] _bg_reconcile_buy error for {token_id[:8]}: {e}")
 
+    async def _wait_for_token_balance(
+        self,
+        token_id: str,
+        timeout_sec: float,
+        min_expected: float = 0.0,
+    ) -> float:
+        """Poll for token balance to arrive (settlement wait)."""
+        deadline = time.monotonic() + timeout_sec
+        last_bal = 0.0
+        while time.monotonic() < deadline:
+            bal = await self._get_token_balance_with_retry(token_id)
+            if bal is not None:
+                last_bal = bal
+                if bal >= min_expected - _BALANCE_DELTA_EPSILON:
+                    return bal
+            await asyncio.sleep(0.5)
+        return last_bal
+
     async def _bg_reconcile_sell(
         self,
         token_id: str,
@@ -429,19 +377,13 @@ class OrderExecutor:
         pre_pusd: float,
         sold_shares: float,
         response_avg: float,
-        pos_side: str = "",
-        pos_window_ts: int = 0,
+        pos_side: str | None = None,
+        pos_window_ts: int | None = None,
         pos_neg_risk: bool = False,
         pos_tick_size: float = 0.01,
     ) -> None:
-        """Background task: verify response-parsed sell fill against on-chain data.
+        """Background task: verify sell settlement and clean up token state.
 
-        Called only when _parse_fill_from_response succeeded (response_avg is the
-        response-reported price). Logs a WARNING if on-chain data significantly
-        contradicts the response.
-
-        CRITICAL: If reconciliation times out AND tokens are still present on-chain,
-        the CLOB response was optimistic (Gnosis Safe relay may have dropped the tx).
         Re-open the position so the exit loop can attempt another sell.
         pos_side / pos_window_ts are needed to reconstruct the position if that happens.
         """
@@ -462,7 +404,6 @@ class OrderExecutor:
                         "Re-opening position for retry."
                     )
                     if pos_side and pos_window_ts:
-                        from .position_tracker import Position
                         self.positions.add(Position(
                             token_id=token_id,
                             side=pos_side,
@@ -480,11 +421,11 @@ class OrderExecutor:
                     )
                 return
             # Sell confirmed on-chain → mark token balance as "known zero" for
-            # 120s so the buy hot path can skip the ~100ms balance pre-check on
-            # any re-entry within this window (extended from 30s: HFT re-entries
-            # happen within seconds of a close; 30s TTL caused unnecessary cold
-            # fetches on the 2nd re-entry in the same window).
-            self._known_zero_until[token_id] = time.time() + 120.0
+            # 1 hour so the buy hot path can ALWAYS skip the ~100ms balance 
+            # pre-check on any re-entry. Tokens are unique per market window;
+            # once confirmed zero, they will never magically increase unless
+            # we explicitly buy them again.
+            self._known_zero_until[token_id] = time.time() + 3600.0
             diff = abs(avg - response_avg)
             if diff > 0.005:
                 log.warning(
@@ -622,18 +563,37 @@ class OrderExecutor:
         else:
             pre_token = (await self._get_token_balance_with_retry(token_id)) or 0.0
             if pre_token > 0.01:
+                # Check if there's already a tracked position for this token.
+                # If NOT: this is an orphan from a previous session / ghost fill.
+                # Rehydrate it into the tracker so the exit engine can sell it
+                # instead of blocking all future entries forever.
+                existing_pos = self.positions.open.get(token_id)
+                if existing_pos is None:
+                    log.warning(
+                        f"[exec] ORPHAN DETECTED: token {token_id[:8]}… has {pre_token:.4f}sh "
+                        "on-chain with no tracked position — rehydrating for managed exit"
+                    )
+                    orphan = Position(
+                        token_id=token_id,
+                        side=side_label,
+                        entry_price=expected_ask,  # best proxy; actual entry unknown
+                        size_shares=pre_token,
+                        cost_usd=pre_token * expected_ask,
+                        market_window_ts=market_window_ts,
+                        neg_risk=neg_risk,
+                        tick_size=tick_size,
+                    )
+                    self.positions.add(orphan)
+                    # Signal caller to check for an open position to exit,
+                    # not to proceed with a new buy.
+                    return FillReport(False, 0.0, 0.0, 0.0, {}, error="orphan-rehydrated")
                 log.warning(
                     f"[exec] buy skipped — token {token_id[:8]}… has {pre_token:.4f}sh balance "
-                    "(previous sell still settling or orphaned position)"
+                    "(previous sell still settling)"
                 )
                 return FillReport(False, 0.0, 0.0, 0.0, {}, error="existing-balance")
 
-        worst_price = round(expected_ask + ENTRY_MAX_DRIFT, 3)
-        log.info(
-            f"[exec] placing market buy {side_label} ${usd_amount:.2f} "
-            f"@≈{expected_ask:.3f} worst={worst_price:.3f} "
-            f"token={token_id[:8]}…"
-        )
+        worst_price = round(expected_ask + self.s.exec_max_drift, 3)
 
         # Pre-flight ask check (O(1) WS lookup) — abort before the API call if the
         # book has already blown past worst_price. Saves the 1.7s timeout budget.
@@ -643,7 +603,7 @@ class OrderExecutor:
                 log.info("[exec] buy aborted — ask unavailable (WS gap)")
                 return FillReport(False, 0.0, 0.0, 0.0, {}, error="ask-gone")
             drift = fresh - expected_ask
-            if drift > ENTRY_MAX_DRIFT:
+            if drift > self.s.exec_max_drift:
                 log.info(
                     f"[exec] buy aborted — fresh ask {fresh:.3f} > worst {worst_price:.3f} "
                     f"(drift ${drift:+.4f})"
@@ -657,26 +617,33 @@ class OrderExecutor:
                 return FillReport(False, 0.0, 0.0, 0.0, {}, error=f"drift({drift:+.4f})")
 
         # Signal-age budget enforcement. The signal that triggered this buy is
-        # only valid for ~1-2s before the book moves; respect _BUY_TOTAL_DEADLINE_SEC
+        # only valid for ~1-2s before the book moves; respect self.s.exec_buy_total_deadline_sec
         # measured from the moment the entry decision fired in main.py.
-        api_timeout = _BUY_API_TIMEOUT_SEC
+        api_timeout = self.s.exec_buy_api_timeout_sec
         if signal_ts_monotonic is not None:
             elapsed_since_signal = time.monotonic() - signal_ts_monotonic
-            budget = _BUY_TOTAL_DEADLINE_SEC - elapsed_since_signal
+            budget = self.s.exec_buy_total_deadline_sec - elapsed_since_signal
             if budget <= 0.20:  # need ≥200ms to even attempt the POST
                 log.info(
                     f"[exec] buy aborted — signal stale "
-                    f"({elapsed_since_signal*1000:.0f}ms > {_BUY_TOTAL_DEADLINE_SEC*1000:.0f}ms budget)"
+                    f"({elapsed_since_signal*1000:.0f}ms > {self.s.exec_buy_total_deadline_sec*1000:.0f}ms budget)"
                 )
                 return FillReport(
                     False, 0.0, 0.0, 0.0, {},
                     error=f"signal-stale({elapsed_since_signal*1000:.0f}ms)",
                 )
-            # Leave ~200ms headroom for ghost-fill check + log work.
-            api_timeout = min(_BUY_API_TIMEOUT_SEC, max(0.30, budget - 0.20))
+            # Once dispatched, we MUST allow the full api_timeout (2.5s).
+            # The Rust FFI thread runs un-interruptibly with a 2.2s timeout. 
+            # If Python's wait_for kills the task earlier, the Rust thread 
+            # will still place the order, creating a catastrophic ghost fill!
 
         # Single attempt with full budget. worst_price is embedded in the order so
         # the exchange kills any unfilled portion above that price automatically.
+        log.info(
+            f"[exec] placing market buy {side_label} ${usd_amount:.2f} "
+            f"@≈{expected_ask:.3f} worst={worst_price:.3f} "
+            f"token={token_id[:8]}…"
+        )
         self._pending_buys.add(token_id)
         resp: dict | None = None
         last_err: str = ""
@@ -722,7 +689,7 @@ class OrderExecutor:
                 last_err = str(e)
                 # Check for ghost fill on network errors OR duplicated order errors
                 # (Duplicated means a previous attempt actually landed but we didn't get the resp).
-                is_net = any(x in last_err.lower() for x in ["error sending request", "connection", "pool error"])
+                is_net = any(x in last_err.lower() for x in ["error sending request", "connection", "pool error", "timeout"])
                 is_dup = "duplicated" in last_err.lower()
                 
                 if is_net or is_dup:
@@ -905,19 +872,17 @@ class OrderExecutor:
         # Guard: reject sells too small for Polymarket's minimum order threshold.
         # 0.0067sh × 0.09 = $0.0006 → always rejected with "invalid amounts".
         # These ghost positions arise from reconciliation corruption; clear them.
-        if sold_shares * mark_price < _MIN_SELL_USD:
+        if sold_shares * mark_price < self.s.exec_min_sell_usd:
             log.warning(
                 f"[exec] position too small to sell: {sold_shares:.6f}sh × "
                 f"{mark_price:.3f} = ${sold_shares * mark_price:.4f} < "
-                f"${_MIN_SELL_USD} minimum — clearing ghost position"
+                f"${self.s.exec_min_sell_usd} minimum — clearing ghost position"
             )
             self.positions.pop_open(token_id)
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="too-small-to-sell")
 
         # Retry loop on FAK kills — same rationale as buy: the book sometimes
         # briefly clears at our implied price and a short pause refills it.
-        # Without this, a single FAK kill stranded the position until the next
-        # tick's exit signal fired ~50-200ms later, missing favorable fills.
         resp: dict | None = None
         last_err: str = ""
         t0 = time.monotonic()
@@ -925,10 +890,10 @@ class OrderExecutor:
         # call, on the first "balance: 0" error. A second "balance: 0" after the wait
         # means tokens were consumed by a phantom previous sell — handle differently.
         _settlement_waited = False
-        for attempt in range(1, _SELL_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.s.exec_sell_max_attempts + 1):
             if attempt > 1:
-                await asyncio.sleep(_SELL_RETRY_DELAY_SEC)
-
+                await asyncio.sleep(self.s.exec_sell_retry_delay_sec)
+ 
             try:
                 # 15% slippage protection for market sell
                 wp = max(round(mark_price * 0.85, 2), 0.01)
@@ -938,13 +903,13 @@ class OrderExecutor:
                         neg_risk=pos_neg_risk,
                         tick_size=f"{pos_tick_size:g}",
                     ),
-                    timeout=_SELL_API_TIMEOUT_SEC,
+                    timeout=self.s.exec_sell_api_timeout_sec,
                 )
             except asyncio.TimeoutError:
                 elapsed_so_far = (time.monotonic() - t0) * 1000
                 log.warning(
-                    f"[exec] sell attempt {attempt}/{_SELL_MAX_ATTEMPTS} "
-                    f"TIMEOUT >{_SELL_API_TIMEOUT_SEC*1000:.0f}ms — retrying "
+                    f"[exec] sell attempt {attempt}/{self.s.exec_sell_max_attempts} "
+                    f"TIMEOUT >{self.s.exec_sell_api_timeout_sec*1000:.0f}ms — retrying "
                     f"(total {elapsed_so_far:.0f}ms so far)"
                 )
                 resp = None
@@ -960,7 +925,7 @@ class OrderExecutor:
                         await asyncio.sleep(0.75)
                         cur_bal = await self._get_token_balance_with_retry(token_id)
                         # Sell confirmed if: (a) no tokens remain, OR (b) only dust remains.
-                        if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON or cur_bal < sold_shares * 0.10:
+                        if cur_bal is None or cur_bal < self.s.exec_balance_delta_epsilon or cur_bal < sold_shares * 0.10:
                             log.info(f"[exec] SELL ghost fill detected: {cur_bal:.4f}sh remaining — assuming filled")
                             self.positions.remove(token_id)
                             self._counters["sell_filled"] += 1
@@ -971,9 +936,9 @@ class OrderExecutor:
                     log.error(f"[exec] sell_to_close failed: {last_err}")
                 
                 is_fak = self._is_fak_kill(last_err)
-                if is_fak and attempt < _SELL_MAX_ATTEMPTS:
+                if is_fak and attempt < self.s.exec_sell_max_attempts:
                     log.info(
-                        f"[exec] sell attempt {attempt}/{_SELL_MAX_ATTEMPTS} "
+                        f"[exec] sell attempt {attempt}/{self.s.exec_sell_max_attempts} "
                         f"killed (FAK no match) — retrying"
                     )
                     resp = None
@@ -1067,17 +1032,14 @@ class OrderExecutor:
                         if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
                             break
                     if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
-                        log.warning(
-                            "[exec] balance=0 and buy not settling — "
-                            "tokens may have been sold by phantom order; closing position"
+                        # CRITICAL BUG FIX: If we have a position from a successful API buy,
+                        # but balance is 0, do NOT delete the position. It's likely just
+                        # a settlement delay. Fail the sell attempt so it retries later.
+                        log.error(
+                            f"[exec] CRITICAL: balance=0 but position tracked! "
+                            f"Buy settlement lagging? Skipping sell and retrying next tick."
                         )
-                        self.positions.close(token_id, mark_price)
-                        self._last_sell_ts[token_id] = time.time()
-                        return FillReport(
-                            True, mark_price, sold_shares,
-                            mark_price * sold_shares, {},
-                            error="phantom-sell-assumed",
-                        )
+                        return FillReport(False, 0.0, 0.0, 0.0, {}, error="settlement-lag")
                     # Tokens appeared — sell was just very slow; retry once more
                     sold_shares = min(cur_bal, sold_shares)
                     resp = None
@@ -1098,7 +1060,34 @@ class OrderExecutor:
 
             ok = bool(resp.get("success", True)) and not resp.get("errorMsg") and not resp.get("message") and not resp.get("error")
             if ok:
-                break
+                # Successfully sent sell order.
+                # Await on-chain verification synchronously to ensure PnL accuracy
+                # for the TRADE RESULT log.
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                log.info(
+                    f"[exec] SELL SENT {pos.side} {sold_shares:.4f}sh in {elapsed_ms:.0f}ms "
+                    f"@≈{mark_price:.4f} — awaiting on-chain settlement..."
+                )
+                fill_avg, proceeds_usd, reconciled_flag = await self._reconcile_sell(
+                    token_id, actual_bal, pre_pusd, sold_shares, mark_price
+                )
+                
+                self._counters["sell_filled"] += 1
+                settle_label = "verified" if reconciled_flag else "estimate — timeout"
+                log.info(
+                    f"[exec] SELL SETTLED {pos.side} {sold_shares:.4f}sh @{fill_avg:.4f} "
+                    f"proceeds=${proceeds_usd:.4f} ({settle_label})"
+                )
+                
+                self.positions.close(token_id, fill_avg)
+                self._last_sell_ts[token_id] = time.time()
+                self._slow_settlement_tokens.discard(token_id)
+                self._known_zero_until[token_id] = time.time() + 3600.0
+                
+                return FillReport(
+                    True, fill_avg, sold_shares, proceeds_usd, 
+                    resp, reconciled=reconciled_flag
+                )
 
             err_msg = str(resp.get("errorMsg") or resp.get("error") or resp.get("message") or "")
             last_err = err_msg
@@ -1114,39 +1103,62 @@ class OrderExecutor:
 
             # Handle "not enough balance" appearing in response body
             if "not enough balance" in err_msg.lower():
-                cur_bal = await self._get_token_balance_with_retry(token_id)
-                if cur_bal is not None and cur_bal < sold_shares:
-                    log.warning(
-                        f"[exec] SELL balance mismatch: tracker={sold_shares:.4f}sh vs "
-                        f"on-chain={cur_bal:.4f}sh — syncing and retrying"
+                # Priority 1: Check if "not enough balance" is due to tokens already matched
+                # in a previous (slow-response) attempt.
+                if "sum of matched orders" in err_msg.lower():
+                    log.warning("[exec] sell response: tokens already matched — awaiting settlement")
+                    # Poll for settlement synchronously.
+                    # Capture current state to compute fill.
+                    pre_pusd = await self.clob.get_usdc_balance() or 0.0
+                    fill_avg, proceeds_usd, reconciled_flag = await self._reconcile_sell(
+                        token_id, actual_bal, pre_pusd, sold_shares, mark_price
                     )
-                    sold_shares = cur_bal
-                    pos.size_shares = cur_bal
-                    if sold_shares * mark_price < _MIN_SELL_USD:
-                        log.info(f"[exec] synced position for {token_id[:8]} is dust — closing")
-                        self.positions.close(token_id, mark_price)
-                        return FillReport(True, mark_price, 0.0, 0.0, {}, error="dust-sync")
-                    resp = None
-                    continue
+                    if reconciled_flag:
+                        log.info(f"[exec] sell confirmed via matched-delta path — {sold_shares:.4f}sh cleared")
+                    else:
+                        log.warning(f"[exec] matched-delta poll timed out — assuming filled @{mark_price:.4f}")
+                    
+                    self.positions.close(token_id, fill_avg)
+                    self._last_sell_ts[token_id] = time.time()
+                    self._slow_settlement_tokens.discard(token_id)
+                    return FillReport(True, fill_avg, sold_shares, proceeds_usd, resp, reconciled=reconciled_flag)
 
-                if "sum of matched orders" in err_msg:
-                    log.warning("[exec] sell response: existing order consuming all tokens — checking...")
-                    await asyncio.sleep(3.0)
-                    cur_bal = await self._get_token_balance_with_retry(token_id)
-                    # Sell confirmed if no tokens or only dust (old residual) remain
-                    if cur_bal is None or cur_bal < sold_shares * 0.50:
-                        log.info(
-                            f"[exec] sell confirmed via response path — {sold_shares:.4f}sh cleared "
-                            f"(residual: {cur_bal or 0:.4f}sh)"
-                        )
-                        self.positions.close(token_id, mark_price)
-                        self._last_sell_ts[token_id] = time.time()
-                        self._slow_settlement_tokens.discard(token_id)
-                        return FillReport(True, mark_price, sold_shares, mark_price * sold_shares, {})
-                    # Substantial tokens still there → retry
-                    sold_shares = min(cur_bal, sold_shares)
-                    resp = None
-                    continue
+                # Priority 2: Check for genuine settlement lag (Buy confirmed but tokens not in RPC yet)
+                cur_bal = await self._get_token_balance_with_retry(token_id)
+                if cur_bal is not None and cur_bal < sold_shares * 0.1: # 0 or dust
+                     # Safety Net: Only assume buy-lag for the first 10 seconds.
+                     # If we've held the position longer, the tokens should be there.
+                     # If they aren't, it's likely we already sold them and missed it.
+                     held_time = time.time() - pos.opened_at
+                     if held_time > 10.0:
+                         log.error(
+                             f"[exec] STALE POS/MISSING BAL: held={held_time:.1f}s but balance=0! "
+                             "Assuming tokens were sold or Resolved — closing tracker to prevent loop."
+                         )
+                         self.positions.close(token_id, mark_price)
+                         self._last_sell_ts[token_id] = time.time()
+                         return FillReport(True, mark_price, sold_shares, mark_price * sold_shares, {}, error="phantom-sync")
+                     
+                     log.warning(
+                         f"[exec] SELL balance mismatch: tracker={sold_shares:.4f}sh vs "
+                         f"on-chain={cur_bal:.4f}sh — Buy settlement lagging? (held {held_time:.1f}s)"
+                     )
+                     return FillReport(False, 0.0, 0.0, 0.0, {}, error="settlement-lag")
+                
+                # If there's some balance but it's less than expected, sync and retry
+                log.warning(
+                    f"[exec] SELL partial balance: tracker={sold_shares:.4f}sh vs "
+                    f"on-chain={cur_bal:.4f}sh — syncing size and retrying"
+                )
+                sold_shares = cur_bal
+                pos.size_shares = cur_bal
+                if sold_shares * mark_price < _MIN_SELL_USD:
+                    log.info(f"[exec] synced position for {token_id[:8]} is dust — closing")
+                    self.positions.close(token_id, mark_price)
+                    return FillReport(True, mark_price, 0.0, 0.0, {}, error="dust-sync")
+                resp = None
+                continue
+
             # Handle "Duplicated" sell: means a prior attempt with same nonce was
             # accepted by the chain. Poll balance to verify if tokens cleared.
             if "duplicated" in err_msg.lower() and attempt <= _SELL_MAX_ATTEMPTS:
@@ -1189,55 +1201,5 @@ class OrderExecutor:
             )
             return FillReport(False, 0.0, 0.0, 0.0, {}, error=f"fak-killed:{last_err}")
 
-        # Parse actual fill from response. For SELL: makingAmount = shares
-        # delivered, takingAmount = USDC received. Use this as the close price
-        # so realized_pnl is accurate, NOT mark_price (which is just our local
-        # bid snapshot and can be wildly stale — case 2: mark=0.05, actual=0.16).
-        expected_proceeds = mark_price * sold_shares
-        parsed = _parse_fill_from_response(resp, "SELL", sold_shares, expected_proceeds)
-        self._counters["sell_filled"] += 1
-        post_ms = resp.get("_post_ms", 0.0) if isinstance(resp, dict) else 0.0
-        sign_ms = resp.get("_sign_ms", 0.0) if isinstance(resp, dict) else 0.0
-        if parsed is not None:
-            filled_size, proceeds_usd, fill_avg = parsed
-            reconciled_flag = True
-            log.info(
-                f"[exec] SELL SENT {pos.side} {filled_size:.4f}sh @≈{fill_avg:.4f} "
-                f"proceeds=${proceeds_usd:.4f} in {elapsed_ms:.0f}ms "
-                f"(sign={sign_ms:.0f}ms post={post_ms:.0f}ms from response)"
-            )
-            self.positions.close(token_id, fill_avg)
-            self._last_sell_ts[token_id] = time.time()
-            self._slow_settlement_tokens.discard(token_id)
-            # Background verify: warn if on-chain data contradicts response.
-            # Passes pos_side/pos_window_ts so the task can re-open the position
-            # if on-chain confirmation times out (Gnosis Safe relay dropped the tx).
-            self._reconciling_sell.add(token_id)
-            asyncio.ensure_future(
-                self._bg_reconcile_sell(
-                    token_id, actual_bal, pre_pusd, sold_shares, fill_avg,
-                    pos_side, pos_window_ts, pos_neg_risk, pos_tick_size,
-                )
-            )
-        else:
-            # Response didn't carry fill amounts (common with Gnosis Safe async
-            # relay). Await on-chain settlement synchronously so PnL is locked
-            # with the real fill price, not a stale mark snapshot. Uses the
-            # extended 20 s timeout (_SELL_FILL_POLL_DEADLINE_SEC).
-            log.info(
-                f"[exec] SELL SENT {pos.side} {sold_shares:.4f}sh in {elapsed_ms:.0f}ms "
-                "— response missing fill amounts, awaiting on-chain settlement..."
-            )
-            fill_avg, proceeds_usd, reconciled_flag = await self._reconcile_sell(
-                token_id, actual_bal, pre_pusd, sold_shares, mark_price
-            )
-            filled_size = sold_shares
-            settle_label = "on-chain reconciled" if reconciled_flag else "mark estimate — settlement timed out"
-            log.info(
-                f"[exec] SELL SETTLED {pos.side} {filled_size:.4f}sh @{fill_avg:.4f} "
-                f"proceeds=${proceeds_usd:.4f} ({settle_label})"
-            )
-            self.positions.close(token_id, fill_avg)
-            self._last_sell_ts[token_id] = time.time()
-
-        return FillReport(True, fill_avg, filled_size, proceeds_usd, resp, reconciled=reconciled_flag)
+        # Fallback for unexpected control flow — should not be reached due to synchronous verification above
+        return FillReport(False, 0.0, 0.0, 0.0, resp, error="unexpected-flow")

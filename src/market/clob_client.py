@@ -49,8 +49,10 @@ from py_clob_client_v2.clob_types import (
     OrderType,
     PartialCreateOrderOptions,
 )
-from py_clob_client_v2.constants import BYTES32_ZERO
 from py_clob_client_v2.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+import orjson
+from py_clob_client_v2.constants import BYTES32_ZERO
 
 from ..config.settings import Settings
 from ..utils.logger import get_logger
@@ -456,24 +458,27 @@ class PolymarketClobClient:
         _rust_pool = self._rust_pool
         _rust_creds = self._rust_creds
 
+        _funder = _client.builder.funder
+        _signer = _client.builder._v2_order_signer()
+        
+        # Math prep in Python (extremely fast ~0.05ms)
+        rc = ROUNDING_CONFIG[tick_size]
+        _, m_amt, t_amt = _client.builder.get_market_order_amounts(BUY, usd_amount, worst_price, rc)
+        
+        _m_amt_s = str(m_amt)
+        _t_amt_s = str(t_amt)
+        
         def _post() -> Any:
             if _rust_pool and _rust_creds:
-                import orjson
-                from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
-                
-                # Math prep in Python (extremely fast ~0.05ms)
-                rc = ROUNDING_CONFIG[tick_size]
-                _, m_amt, t_amt = _client.builder.get_market_order_amounts(BUY, usd_amount, worst_price, rc)
-                
                 # FFI Call: Generation, Keccak256 Hashing, k256 ECDSA, JSON, HTTP/2 POST
                 _t_ffi = time.monotonic()
                 resp_str = _rust_pool.sign_and_post_order(
                     _rust_creds,
-                    _client.builder.funder,
-                    _client.builder._v2_order_signer(),
+                    _funder,
+                    _signer,
                     token_id,
-                    str(m_amt),
-                    str(t_amt),
+                    _m_amt_s,
+                    _t_amt_s,
                     0,  # BUY side
                     neg_risk
                 )
@@ -562,8 +567,6 @@ class PolymarketClobClient:
         await self.ensure_ready()
         
         if self._rust_pool and self._rust_creds:
-            from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
-            import orjson
             rc = ROUNDING_CONFIG[tick_size]
             _client = self.client
             _, m_amt, t_amt = _client.builder.get_market_order_amounts(
