@@ -19,6 +19,7 @@ from .signals.mispricing import MispricingEvaluator
 from .signals.momentum import MomentumAnalyzer
 from .strategy.entry_engine import EntryEngine
 from .strategy.exit_engine import ExitEngine
+from .strategy.volatility_monitor import VolatilityMonitor
 from .utils.logger import get_logger, setup_logger
 from .utils.time_utils import (
     current_window_start,
@@ -72,9 +73,10 @@ class TradingBot:
         self.momentum = MomentumAnalyzer(self.agg)
         self.leadlag = LeadLagDetector(self.agg)
         self.mispricing = MispricingEvaluator(
-            sigma_per_sec=self.s.sig_sigma_per_sec,
+            sigma_per_sec=0.00010,
             momentum_drift_weight=self.s.sig_momentum_drift_weight,
             leadlag_drift_weight_per_bp=self.s.sig_leadlag_drift_weight_per_bp,
+            log_now_decay=self.s.sig_log_now_decay,
         )
 
         self.entry_engine = EntryEngine(self.s)
@@ -83,6 +85,7 @@ class TradingBot:
         self.positions = PositionTracker()
         self.executor = OrderExecutor(self.s, self.clob, self.positions)
         self.risk = RiskManager(self.s)
+        self.vol_monitor = VolatilityMonitor(self.agg, self.s)
 
         self._stop = asyncio.Event()
         self._current_market: MarketInfo | None = None
@@ -104,20 +107,13 @@ class TradingBot:
         # repeats every 50ms tick (e.g. post-sell-cooldown for 5s = 100 lines).
         self._last_buy_fail_reason: str = ""
         self._start_time: float = time.time()
-        # Stop new entries after N consecutive losing trades in the same window.
-        # Prevents overtrading when the market is clearly trending against our
-        # signals — e.g., 4 consecutive UP losses while market resolves DOWN.
+        # Stop new entries after N consecutive losing trades.
+        # This persists across windows to prevent 'window-start' overtrading.
         self._consecutive_losses: int = 0
-        self._window_trading_stopped: bool = False
-        # Rapid flip cooldown: after a side-flip exit with hold_time < 15s,
-        # block new entries for 30s. A flip within 15s means the market was
-        # in a highly uncertain/flip-flopping state — re-entering immediately
-        # lands us in the same instability and almost always loses again.
+        self._loss_cooldown_until: float = 0.0
+        self._last_exit_side: str = ""
+        self._last_trade_exit_ts: float = 0.0
         self._last_rapid_flip_ts: float = 0.0
-        _RAPID_FLIP_HOLD_SEC = 15.0   # exit within this → considered a rapid flip
-        _RAPID_FLIP_COOLDOWN_SEC = 30.0  # how long to block re-entry after rapid flip
-        self._rapid_flip_hold_sec: float = _RAPID_FLIP_HOLD_SEC
-        self._rapid_flip_cooldown_sec: float = _RAPID_FLIP_COOLDOWN_SEC
         # High-water mark for current open position — used for trailing stop logic.
         # Tracks peak unrealized_pct since entry; resets when position closes.
         self._peak_unreal: float = 0.0
@@ -319,6 +315,22 @@ class TradingBot:
                 f"fak={c['sell_fak_killed']} failed={c['sell_failed']} (success={sell_rate:.0f}%)"
             )
 
+        # ---- Adaptive Regime Update ----
+        # Dynamically adjust strategy thresholds based on 1m candle volatility.
+        # This keeps the HFT loop lean (no calc here) while staying adaptive.
+        rp = self.vol_monitor.get_regime_params()
+        self.mispricing.update_sigma(rp["sigma"])
+        self.entry_engine.update_thresholds(
+            min_edge=rp["min_edge"],
+            min_momentum_z=rp["min_momentum_z"],
+            min_leadlag_bps=rp["min_leadlag_bps"],
+            regime=self.vol_monitor.regime
+        )
+        self.exit_engine.update_thresholds(
+            min_edge=rp["min_edge"],
+            min_leadlag_bps=rp["min_leadlag_bps"]
+        )
+
         mom = self.momentum.read(now)
         ll = self.leadlag.read(now)
         up_ask = self._ask_for(m.up_token_id)
@@ -369,17 +381,19 @@ class TradingBot:
                 )
                 sell = await self.executor.sell_to_close(existing.token_id, mark)
                 if sell.success:
+                    self._last_exit_side = existing.side
+                    self._last_trade_exit_ts = time.time()
                     self._last_sell_fail_ts = 0.0
                     self._last_sell_fail_reason = ""
                     self._peak_unreal = 0.0
                     # Rapid flip detection: a side-flip exit within 15s means the
                     # market was in a highly unstable/flip-flopping state. Set a
                     # 30s cooldown to prevent re-entering into the same instability.
-                    if ed.reason.startswith("side-flipped") and seconds_held < self._rapid_flip_hold_sec:
+                    if ed.reason.startswith("side-flipped") and seconds_held < self.s.exit_rapid_flip_hold_sec:
                         self._last_rapid_flip_ts = time.time()
                         self.log.info(
-                            f"[bot] rapid-flip detected (held={seconds_held:.0f}s<{self._rapid_flip_hold_sec:.0f}s) "
-                            f"— blocking entries for {self._rapid_flip_cooldown_sec:.0f}s"
+                            f"[bot] rapid-flip detected (held={seconds_held:.0f}s<{self.s.exit_rapid_flip_hold_sec:.0f}s) "
+                            f"— blocking entries for {self.s.exit_rapid_flip_cooldown_sec:.0f}s"
                         )
                     # BUG FIX: Do NOT read realized_pnl from positions.closed[-1].
                     # closed[-1] may be a DIFFERENT position (from a prior window) if
@@ -395,11 +409,12 @@ class TradingBot:
                             f"exit={actual_exit:.3f} pnl={pnl:+.4f} — LOSS "
                             f"(consecutive={self._consecutive_losses})"
                         )
-                        if self._consecutive_losses >= 2 and not self._window_trading_stopped:
-                            self._window_trading_stopped = True
+                        if self._consecutive_losses >= 2:
+                            # Use configurable cooldown duration
+                            self._loss_cooldown_until = time.time() + self.s.risk_consecutive_loss_cooldown_sec
                             self.log.warning(
                                 f"[bot] {self._consecutive_losses} consecutive losses "
-                                "— stopping new entries for this window"
+                                f"— COOOLDOWN: stopping all entries for {self.s.risk_consecutive_loss_cooldown_sec:.0f}s"
                             )
                     else:
                         self._consecutive_losses = 0
@@ -427,11 +442,14 @@ class TradingBot:
         if self.executor.in_cooldown():
             return
 
-        # After 2 consecutive losses in this window, stop all new entries.
-        # Prevents overtrading when our signal direction is clearly wrong for
-        # this market — continuing to re-enter just compounds the losses.
-        if self._window_trading_stopped:
+        # Global Loss Cooldown: After 2 consecutive losses, stop all entries
+        # for a fixed duration to prevent bleeding in a bad regime.
+        if now < self._loss_cooldown_until:
+            rem = self._loss_cooldown_until - now
+            if self._tick_count % 100 == 0: # log occasionally
+                self.log.debug(f"[bot] loss cooldown active: {rem:.0f}s remaining")
             return
+
 
         # Rapid flip cooldown: block re-entry for 30s after a side-flip exit
         # that happened within 15s of entry. A rapid flip means the market was
@@ -439,8 +457,8 @@ class TradingBot:
         # loses again (confirmed in live trading: 100% loss rate for entries
         # within 5s of a rapid-flip exit).
         elapsed_since_flip = time.time() - self._last_rapid_flip_ts
-        if elapsed_since_flip < self._rapid_flip_cooldown_sec:
-            remaining = self._rapid_flip_cooldown_sec - elapsed_since_flip
+        if elapsed_since_flip < self.s.exit_rapid_flip_cooldown_sec:
+            remaining = self.s.exit_rapid_flip_cooldown_sec - elapsed_since_flip
             abort_key = "rapid-flip-cooldown"
             if abort_key != self._last_abort_key:
                 self._last_abort_key = abort_key
@@ -481,6 +499,17 @@ class TradingBot:
 
         if not decision.enter:
             return
+
+        # Post-Trade Cooldown (Side-Specific): 
+        # Only block re-entry if it's the SAME side we just exited.
+        # This prevents 'churning' but allows instant reversals for HFT.
+        if decision.side == self._last_exit_side:
+            elapsed = now - self._last_trade_exit_ts
+            if elapsed < self.s.exec_post_sell_guard_sec:
+                rem = self.s.exec_post_sell_guard_sec - elapsed
+                if self._tick_count % 100 == 0:
+                    self.log.debug(f"[bot] side-cooldown active for {decision.side}: {rem:.0f}s remaining")
+                return
 
         # Capture signal timestamp NOW so buy_to_open can enforce the 2s
         # signal-to-fill budget across all subsequent work (re-validation,
@@ -533,6 +562,9 @@ class TradingBot:
                 self.log.info(f"[bot] entry aborted — {anchor_reason}")
             return
         self._last_abort_key = ""
+        # Reset signal key so that if we enter/exit/re-enter with the same
+        # signal params, it still gets logged in signals.log for auditing.
+        self._last_signal_key = ""
         # Use the fresher ask for execution so the slippage cap reflects reality.
         execution_ask = fresh_ask
 
@@ -599,9 +631,7 @@ class TradingBot:
                 # fresh, and stale anchors from a previous window must not gate
                 # new entries.
                 self.executor.clear_signal_anchors()
-                # Reset loss-stop counters so new window starts with full trading budget.
-                self._consecutive_losses = 0
-                self._window_trading_stopped = False
+                # Reset per-window state (but NOT loss cooldown)
                 self._last_buy_fail_reason = ""
                 self._last_abort_key = ""
                 self._last_rapid_flip_ts = 0.0
@@ -873,6 +903,7 @@ class TradingBot:
             f"odds=[{self.s.min_odds},{self.s.max_odds}] "
             f"max_daily_loss=${self.s.max_daily_loss_usd}"
         )
+        self.vol_monitor.start()
         await asyncio.gather(
             self.binance.start(),
             self.coinbase.start(),
@@ -891,6 +922,7 @@ class TradingBot:
             await self._strategy_loop()
         finally:
             self._stop.set()
+            self.vol_monitor.stop()
             await asyncio.gather(
                 self.binance.stop(),
                 self.coinbase.stop(),

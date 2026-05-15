@@ -19,6 +19,15 @@ class ExitEngine:
     def __init__(self, settings: Settings):
         self.s = settings
         self._last_mispricing_ts: float = time.time()  # init to now so first ticks get a grace period
+        
+        # Current active thresholds (updated by regime)
+        self.active_min_edge: float = settings.steady_min_edge
+        self.active_min_leadlag_bps: float = settings.steady_min_leadlag_bps
+
+    def update_thresholds(self, min_edge: float, min_leadlag_bps: float):
+        """Update active thresholds based on volatility regime."""
+        self.active_min_edge = min_edge
+        self.active_min_leadlag_bps = min_leadlag_bps
 
     def decide(
         self,
@@ -102,8 +111,8 @@ class ExitEngine:
 
         # Edge collapse — different tolerance based on P&L
         edge_floor = (
-            self.s.min_edge * self.s.exit_edge_collapse_profit_frac if in_profit
-            else self.s.min_edge * self.s.exit_edge_collapse_loss_frac
+            self.active_min_edge * self.s.exit_edge_collapse_profit_frac if in_profit
+            else self.active_min_edge * self.s.exit_edge_collapse_loss_frac
         )
         if mispricing.edge < edge_floor:
             regime = "profit" if in_profit else "loss"
@@ -123,8 +132,8 @@ class ExitEngine:
         if leadlag is not None:
             signed = leadlag.deviation_bps if side == "UP" else -leadlag.deviation_bps
             ll_floor = (
-                self.s.min_leadlag_bps * self.s.exit_ll_converge_profit_frac if in_profit
-                else self.s.min_leadlag_bps * self.s.exit_ll_converge_loss_frac
+                self.active_min_leadlag_bps * self.s.exit_ll_converge_profit_frac if in_profit
+                else self.active_min_leadlag_bps * self.s.exit_ll_converge_loss_frac
             )
             if signed < ll_floor:
                 # Confirmation gates

@@ -82,21 +82,26 @@ class Settings:
     ev_override_min_edge: float
 
     # Strategy tuning
-    min_edge: float
-    min_momentum_z: float
-    min_leadlag_bps: float
     entry_window_start_sec: int
     entry_window_end_sec: int
     exit_hard_floor_sec: int
+    exit_rapid_flip_hold_sec: float
+    exit_rapid_flip_cooldown_sec: float
 
     # Signal Logic
-    sig_sigma_per_sec: float
     sig_momentum_drift_weight: float
     sig_leadlag_drift_weight_per_bp: float
+    sig_log_now_decay: float
+
+    # Risk Management
+    risk_consecutive_loss_cooldown_sec: float
+    entry_turbo_low_ask_limit: float
 
     # Entry Engine
     entry_min_exit_bid: float
     entry_max_spread: float
+    entry_max_momentum_z: float
+    entry_persistence_ticks: int
 
     # Exit Engine
     exit_stale_seconds: float
@@ -135,6 +140,25 @@ class Settings:
     exec_sell_fill_poll_deadline_sec: float
     exec_min_sell_usd: float
     exec_post_sell_guard_sec: float
+
+    # Adaptive Config
+    vol_choppy_threshold: float
+    vol_turbo_threshold: float
+    
+    steady_min_edge: float
+    steady_min_momentum_z: float
+    steady_min_leadlag_bps: float
+    steady_sigma: float
+
+    choppy_min_edge: float
+    choppy_min_momentum_z: float
+    choppy_min_leadlag_bps: float
+    choppy_sigma: float
+
+    turbo_min_edge: float
+    turbo_min_momentum_z: float
+    turbo_min_leadlag_bps: float
+    turbo_sigma: float
 
     # Logging
     log_level: str
@@ -186,21 +210,26 @@ def load_settings(env_path: str | None = None) -> Settings:
         max_odds=_envf("MAX_ODDS", 0.65),
         allow_out_of_bound_ev=_envb("ALLOW_OUT_OF_BOUND_EV", True),
         ev_override_min_edge=_envf("EV_OVERRIDE_MIN_EDGE", 0.20),
-        min_edge=_envf("MIN_EDGE", 0.04),
-        min_momentum_z=_envf("MIN_MOMENTUM_Z", 2.0),
-        min_leadlag_bps=_envf("MIN_LEADLAG_BPS", 2.0),
         entry_window_start_sec=_envi("ENTRY_WINDOW_START_SEC", 60),
         entry_window_end_sec=_envi("ENTRY_WINDOW_END_SEC", 270),
         exit_hard_floor_sec=_envi("EXIT_HARD_FLOOR_SEC", 15),
+        exit_rapid_flip_hold_sec=_envf("EXIT_RAPID_FLIP_HOLD_SEC", 15.0),
+        exit_rapid_flip_cooldown_sec=_envf("EXIT_RAPID_FLIP_COOLDOWN_SEC", 30.0),
 
         # Signal Logic
-        sig_sigma_per_sec=_envf("SIG_SIGMA_PER_SEC", 0.00006),
         sig_momentum_drift_weight=_envf("SIG_MOMENTUM_DRIFT_WEIGHT", 0.0008),
         sig_leadlag_drift_weight_per_bp=_envf("SIG_LEADLAG_DRIFT_WEIGHT_PER_BP", 0.0002),
+        sig_log_now_decay=_envf("SIG_LOG_NOW_DECAY", 0.5),
+
+        # Risk Management
+        risk_consecutive_loss_cooldown_sec=_envf("RISK_CONSECUTIVE_LOSS_COOLDOWN_SEC", 300.0),
+        entry_turbo_low_ask_limit=_envf("ENTRY_TURBO_LOW_ASK_LIMIT", 0.20),
         
         # Entry Engine
-        entry_min_exit_bid=_envf("ENTRY_MIN_EXIT_BID", 0.05),
+        entry_min_exit_bid=_envf("ENTRY_MIN_EXIT_BID", 0.10),
         entry_max_spread=_envf("ENTRY_MAX_SPREAD", 0.15),
+        entry_max_momentum_z=_envf("ENTRY_MAX_MOMENTUM_Z", 6.0),
+        entry_persistence_ticks=_envi("ENTRY_PERSISTENCE_TICKS", 3),
 
         # Exit Engine
         exit_stale_seconds=_envf("EXIT_STALE_SECONDS", 10.0),
@@ -208,7 +237,7 @@ def load_settings(env_path: str | None = None) -> Settings:
         exit_own_fill_grace_seconds=_envf("EXIT_OWN_FILL_GRACE_SECONDS", 1.0),
         exit_take_profit_pct=_envf("EXIT_TAKE_PROFIT_PCT", 3.00),
         exit_trailing_stop_min_peak=_envf("EXIT_TRAILING_STOP_MIN_PEAK", 0.20),
-        exit_trailing_stop_dist=_envf("EXIT_TRAILING_STOP_DIST", 0.10),
+        exit_trailing_stop_dist=_envf("EXIT_TRAILING_STOP_DIST", 0.12),
         exit_profit_hold_pct=_envf("EXIT_PROFIT_HOLD_PCT", 0.05),
         exit_loss_exit_z=_envf("EXIT_LOSS_EXIT_Z", 1.5),
         exit_z_in_profit=_envf("EXIT_Z_IN_PROFIT", 1.8),
@@ -218,7 +247,7 @@ def load_settings(env_path: str | None = None) -> Settings:
         exit_ll_converge_profit_frac=_envf("EXIT_LL_CONVERGE_PROFIT_FRAC", -0.50),
         exit_ll_min_adverse_z=_envf("EXIT_LL_MIN_ADVERSE_Z", 1.0),
         exit_ll_min_loss_pct=_envf("EXIT_LL_MIN_LOSS_PCT", -0.15),
-        exit_hard_stop_loss_pct=_envf("EXIT_HARD_STOP_LOSS_PCT", -0.40),
+        exit_hard_stop_loss_pct=_envf("EXIT_HARD_STOP_LOSS_PCT", -0.30),
 
         # Order Execution
         exec_order_fail_cooldown_sec=_envf("EXEC_ORDER_FAIL_COOLDOWN_SEC", 5.0),
@@ -238,7 +267,27 @@ def load_settings(env_path: str | None = None) -> Settings:
         exec_sell_api_timeout_sec=_envf("EXEC_SELL_API_TIMEOUT_SEC", 2.5),
         exec_sell_fill_poll_deadline_sec=_envf("EXEC_SELL_FILL_POLL_DEADLINE_SEC", 20.0),
         exec_min_sell_usd=_envf("EXEC_MIN_SELL_USD", 0.05),
-        exec_post_sell_guard_sec=_envf("EXEC_POST_SELL_GUARD_SEC", 5.0),
+        exec_post_sell_guard_sec=_envf("EXEC_POST_SELL_GUARD_SEC", 10.0),
+
+        # Adaptive Config
+        vol_choppy_threshold=_envf("VOL_CHOPPY_THRESHOLD", 4.0),
+        vol_turbo_threshold=_envf("VOL_TURBO_THRESHOLD", 7.5),
+        
+        steady_min_edge=_envf("STEADY_MIN_EDGE", 0.10),
+        steady_min_momentum_z=_envf("STEADY_MIN_MOM_Z", 2.7),
+        steady_min_leadlag_bps=_envf("STEADY_MIN_LL_BPS", 2.7),
+        steady_sigma=_envf("STEADY_SIGMA", 0.00008),
+
+        choppy_min_edge=_envf("CHOPPY_MIN_EDGE", 0.14),
+        choppy_min_momentum_z=_envf("CHOPPY_MIN_MOM_Z", 3.2),
+        choppy_min_leadlag_bps=_envf("CHOPPY_MIN_LL_BPS", 3.2),
+        choppy_sigma=_envf("CHOPPY_SIGMA", 0.00010),
+
+        turbo_min_edge=_envf("TURBO_MIN_EDGE", 0.12),
+        turbo_min_momentum_z=_envf("TURBO_MIN_MOM_Z", 3.0),
+        turbo_min_leadlag_bps=_envf("TURBO_MIN_LL_BPS", 3.0),
+        turbo_sigma=_envf("TURBO_SIGMA", 0.00009),
+
         log_level=_env("LOG_LEVEL", "INFO"),
         log_file=_env("LOG_FILE", "logs/bot.log"),
         project_root=root,

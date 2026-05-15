@@ -94,7 +94,7 @@ class OrderExecutor:
         # repeated FAK kills.
         self._entry_signal_anchor: dict[tuple[int, str], tuple[float, float]] = {}
         # Per-token timestamp of last confirmed sell. Guards against re-buying
-        # within the Gnosis Safe settlement window (_POST_SELL_GUARD_SEC).
+        # within the configurable settlement window (exec_post_sell_guard_sec).
         self._last_sell_ts: dict[str, float] = {}
         # Per-token "known zero balance until" timestamp. Set by sell reconciler
         # when on-chain confirms tokens are gone. While now < this value, the
@@ -501,6 +501,13 @@ class OrderExecutor:
         if token_id in self._pending_buys:
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="buy-in-flight")
 
+        # Block re-buy while a previous sell's reconcile is still in flight.
+        if token_id in self._reconciling_sell:
+            log.warning(
+                f"[exec] buy skipped — sell reconcile still in flight for {token_id[:8]}…"
+            )
+            return FillReport(False, 0.0, 0.0, 0.0, {}, error="sell-reconciling")
+
         if self.s.dry_run:
             shares = usd_amount / max(expected_ask, 1e-3)
             log.info(
@@ -521,32 +528,6 @@ class OrderExecutor:
             )
             self._entry_signal_anchor.pop((market_window_ts, side_label), None)
             return FillReport(True, expected_ask, shares, usd_amount, {"dry": True})
-
-        # Post-sell guard: block re-buy for _POST_SELL_GUARD_SEC (5s) after any sell.
-        # From bot.log: Gnosis Safe on-chain confirmation arrives in ~1.5-2s, but the
-        # CLOB balance shows 0 immediately on acknowledgment. Re-buying in that window
-        # causes bg_reconcile to capture pre_token=0, then see old+new tokens in the
-        # delta → inflated size and wrong entry price.
-        last_sell = self._last_sell_ts.get(token_id, 0.0)
-        elapsed_since_sell = time.time() - last_sell
-        if elapsed_since_sell < _POST_SELL_GUARD_SEC:
-            log.warning(
-                f"[exec] buy skipped — sold {elapsed_since_sell:.1f}s ago "
-                f"(Gnosis Safe guard: wait {_POST_SELL_GUARD_SEC:.0f}s)"
-            )
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="post-sell-cooldown")
-
-        # Block re-buy while a previous sell's reconcile is still in flight.
-        # The post-sell guard above (5s) is shorter than the reconcile deadline
-        # (20s); without this check, the reconcile could time out and re-open
-        # the OLD position while a NEW position is also open → double-position
-        # corruption (see Bug 1 / Bug 2 in project memory).
-        if token_id in self._reconciling_sell:
-            log.warning(
-                f"[exec] buy skipped — sell reconcile still in flight for "
-                f"{token_id[:8]}… (would risk double-position on timeout)"
-            )
-            return FillReport(False, 0.0, 0.0, 0.0, {}, error="sell-reconciling")
 
         # Token balance pre-check.
         # Hot-path optimisation: skip the ~100ms HTTP fetch when we KNOW the

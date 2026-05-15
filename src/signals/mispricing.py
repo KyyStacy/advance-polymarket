@@ -40,10 +40,16 @@ class MispricingEvaluator:
         sigma_per_sec: float = 0.000_06,
         momentum_drift_weight: float = 0.0008,
         leadlag_drift_weight_per_bp: float = 0.0002,
+        log_now_decay: float = 0.5,
     ):
         self.sigma_per_sec = sigma_per_sec
         self.mom_w = momentum_drift_weight
         self.ll_w = leadlag_drift_weight_per_bp
+        self.log_now_decay = log_now_decay
+
+    def update_sigma(self, sigma: float):
+        """Update the underlying volatility parameter for fair price calculation."""
+        self.sigma_per_sec = sigma
 
     def estimate_fair_p_up(
         self,
@@ -56,15 +62,28 @@ class MispricingEvaluator:
         if anchor_price <= 0 or current_cex <= 0 or seconds_left <= 0:
             return 0.5, {"reason": "no-signal"}
 
-        # Drift from current position relative to anchor (already-banked move).
+        # 1. State: Move that has already happened relative to anchor.
         log_now = math.log(current_cex / anchor_price)
+        
+        # FIX 1: Apply time-based decay to log_now. 
+        # At the start of a candle (seconds_left is large), log_now is "noisy".
+        # We shouldn't bet solely on the fact that price is already up/down.
+        # As we approach resolution, log_now becomes "realized profit".
+        # window_total is usually 300s (5m) or 60s (1m). 
+        # We'll use a conservative 300s baseline or the current window's max.
+        window_total = max(300.0, seconds_left)
+        progress = 1.0 - (seconds_left / window_total)
+        # log_now_decayed = log_now * (0.2 + 0.8 * progress) # Start with 20% weight, end at 100%
+        log_now_decayed = log_now * self.log_now_decay 
 
-        # Forward drift from momentum + lead-lag (per-second drift, integrated).
+        # 2. Prediction: Forward drift from momentum + lead-lag.
         mu = self.mom_w * momentum.return_30s + self.ll_w * (
             (leadlag.deviation_bps if leadlag else 0.0)
         )
         drift_forward = mu * seconds_left
-        log_total = log_now + drift_forward
+        
+        # log_total is our 'conviction' level for the resolution price.
+        log_total = log_now_decayed + drift_forward
 
         sigma = self.sigma_per_sec * math.sqrt(max(seconds_left, 1.0))
         if sigma <= 1e-12:
@@ -73,8 +92,10 @@ class MispricingEvaluator:
             # P(Z >= -log_total/sigma) = Phi(log_total/sigma)
             p_up = 0.5 * (1 + math.erf((log_total / sigma) / math.sqrt(2)))
         p_up = min(0.999, max(0.001, p_up))
+        
         basis = {
             "log_now": log_now,
+            "log_now_decayed": log_now_decayed,
             "mu_per_sec": mu,
             "drift_forward": drift_forward,
             "sigma": sigma,
