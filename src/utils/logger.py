@@ -49,8 +49,8 @@ def setup_logger(level: str = "INFO", log_file: str | None = None, console: bool
         logger.add(
             log_file,
             level=level.upper(),
-            rotation="20 MB",
-            retention="14 days",
+            rotation="1 MB",
+            retention=1,
             format=(
                 "<green>{extra[utc7_time]}</green> "
                 "<level>{level: <7}</level> "

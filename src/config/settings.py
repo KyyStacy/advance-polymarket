@@ -217,9 +217,9 @@ def load_settings(env_path: str | None = None) -> Settings:
         exit_rapid_flip_cooldown_sec=_envf("EXIT_RAPID_FLIP_COOLDOWN_SEC", 30.0),
 
         # Signal Logic
-        sig_momentum_drift_weight=_envf("SIG_MOMENTUM_DRIFT_WEIGHT", 0.0008),
+        sig_momentum_drift_weight=_envf("SIG_MOMENTUM_DRIFT_WEIGHT", 0.0012),
         sig_leadlag_drift_weight_per_bp=_envf("SIG_LEADLAG_DRIFT_WEIGHT_PER_BP", 0.0002),
-        sig_log_now_decay=_envf("SIG_LOG_NOW_DECAY", 0.5),
+        sig_log_now_decay=_envf("SIG_LOG_NOW_DECAY", 0.15),
 
         # Risk Management
         risk_consecutive_loss_cooldown_sec=_envf("RISK_CONSECUTIVE_LOSS_COOLDOWN_SEC", 300.0),
@@ -229,7 +229,7 @@ def load_settings(env_path: str | None = None) -> Settings:
         entry_min_exit_bid=_envf("ENTRY_MIN_EXIT_BID", 0.10),
         entry_max_spread=_envf("ENTRY_MAX_SPREAD", 0.15),
         entry_max_momentum_z=_envf("ENTRY_MAX_MOMENTUM_Z", 6.0),
-        entry_persistence_ticks=_envi("ENTRY_PERSISTENCE_TICKS", 3),
+        entry_persistence_ticks=_envi("ENTRY_PERSISTENCE_TICKS", 2),
 
         # Exit Engine
         exit_stale_seconds=_envf("EXIT_STALE_SECONDS", 10.0),
@@ -274,19 +274,19 @@ def load_settings(env_path: str | None = None) -> Settings:
         vol_turbo_threshold=_envf("VOL_TURBO_THRESHOLD", 7.5),
         
         steady_min_edge=_envf("STEADY_MIN_EDGE", 0.10),
-        steady_min_momentum_z=_envf("STEADY_MIN_MOM_Z", 2.7),
-        steady_min_leadlag_bps=_envf("STEADY_MIN_LL_BPS", 2.7),
+        steady_min_momentum_z=_envf("STEADY_MIN_MOM_Z", 2.6),
+        steady_min_leadlag_bps=_envf("STEADY_MIN_LL_BPS", 2.8),
         steady_sigma=_envf("STEADY_SIGMA", 0.00008),
 
         choppy_min_edge=_envf("CHOPPY_MIN_EDGE", 0.14),
-        choppy_min_momentum_z=_envf("CHOPPY_MIN_MOM_Z", 3.2),
-        choppy_min_leadlag_bps=_envf("CHOPPY_MIN_LL_BPS", 3.2),
+        choppy_min_momentum_z=_envf("CHOPPY_MIN_MOM_Z", 3.1),
+        choppy_min_leadlag_bps=_envf("CHOPPY_MIN_LL_BPS", 3.3),
         choppy_sigma=_envf("CHOPPY_SIGMA", 0.00010),
 
-        turbo_min_edge=_envf("TURBO_MIN_EDGE", 0.12),
-        turbo_min_momentum_z=_envf("TURBO_MIN_MOM_Z", 3.0),
-        turbo_min_leadlag_bps=_envf("TURBO_MIN_LL_BPS", 3.0),
-        turbo_sigma=_envf("TURBO_SIGMA", 0.00009),
+        turbo_min_edge=_envf("TURBO_MIN_EDGE", 0.18),
+        turbo_min_momentum_z=_envf("TURBO_MIN_MOM_Z", 3.6),
+        turbo_min_leadlag_bps=_envf("TURBO_MIN_LL_BPS", 3.8),
+        turbo_sigma=_envf("TURBO_SIGMA", 0.00012),
 
         log_level=_env("LOG_LEVEL", "INFO"),
         log_file=_env("LOG_FILE", "logs/bot.log"),
