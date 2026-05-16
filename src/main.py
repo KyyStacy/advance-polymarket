@@ -357,7 +357,9 @@ class TradingBot:
             self._peak_unreal = max(self._peak_unreal, unreal_pct)
             seconds_held = now - existing.opened_at
             ed = self.exit_engine.decide(
-                existing.side, sec_left, mom, ll, misp, unreal_pct, seconds_held,
+                existing.side, sec_left, mom, ll, misp, unreal_pct,
+                sigma=self.misp_eval.sigma,
+                seconds_held=seconds_held,
                 peak_unreal=self._peak_unreal,
             )
             

@@ -37,9 +37,31 @@ class ExitEngine:
         leadlag: LeadLagReading | None,
         mispricing: MispricingReading | None,
         unrealized_pct: float,
+        sigma: float,
         seconds_held: float = 0.0,
         peak_unreal: float = 0.0,
     ) -> ExitDecision:
+        # ---- VICTORY LOCK (Fix 6 - Paranoid Edition) ----
+        # We only lock if:
+        # 1. We are in the final stretch (last 120s).
+        # 2. Mathematical safety is extreme (Z >= victory_lock_z).
+        # 3. Momentum is NOT strongly against us (Adverse Z < 2.5).
+        if mispricing is not None and mispricing.anchor_price > 0 and seconds_left <= 120:
+            import math
+            log_dist = math.log(mispricing.current_cex / mispricing.anchor_price)
+            if side == "DOWN":
+                log_dist = -log_dist
+            
+            sigma_left = sigma * math.sqrt(max(seconds_left, 1.0))
+            safety_z = log_dist / max(sigma_left, 1e-9)
+            
+            if safety_z >= self.s.exit_victory_lock_z:
+                # Check for "Black Swan" momentum reversal
+                is_adverse_mom = (side == "UP" and momentum.direction == -1) or (side == "DOWN" and momentum.direction == 1)
+                if not (is_adverse_mom and momentum.z_score > 2.5):
+                    return ExitDecision(False, f"victory-lock[protected] z={safety_z:.1f} mom-z={momentum.z_score:.1f}")
+                # If adverse momentum is too strong, fall through to normal exit logic!
+
         # Hard time floor — always honor before resolution lag eats us
         if seconds_left <= self.s.exit_hard_floor_sec:
             return ExitDecision(True, f"time-floor<={self.s.exit_hard_floor_sec}s")
