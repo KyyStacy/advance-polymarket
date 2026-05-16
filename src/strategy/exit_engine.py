@@ -81,8 +81,16 @@ class ExitEngine:
                     f"trailing-stop peak={peak_unreal:+.1%} drop={drawdown:.1%}>={self.s.exit_trailing_stop_dist:.1%}"
                 )
 
-        # Side flip — model fully disagrees. Always exit (bypasses min hold).
+        # Side flip — model fully disagrees. Always exit (bypasses min hold)
+        # unless Momentum Shield is active.
         if mispricing.side is not None and mispricing.side != side:
+            # FIX 5: Momentum Shield
+            # If momentum is strongly supporting our current side, ignore the side-flip.
+            # This protects against 'Anchor Gravity' at the end of windows.
+            mom_supports = (side == "UP" and momentum.direction == 1) or (side == "DOWN" and momentum.direction == -1)
+            if mom_supports and momentum.z_score >= self.s.exit_momentum_shield_z:
+                 return ExitDecision(False, f"shield[active] mom-z={momentum.z_score:.2f}>={self.s.exit_momentum_shield_z}")
+
             return ExitDecision(True, f"side-flipped fair_p_up={mispricing.fair_p_up:.3f}")
 
         # Min hold time — block signal-based exits during initial settle period.

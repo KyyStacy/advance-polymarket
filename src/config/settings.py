@@ -120,6 +120,7 @@ class Settings:
     exit_ll_min_adverse_z: float
     exit_ll_min_loss_pct: float
     exit_hard_stop_loss_pct: float
+    exit_momentum_shield_z: float
 
     # Order Execution
     exec_order_fail_cooldown_sec: float
@@ -248,6 +249,7 @@ def load_settings(env_path: str | None = None) -> Settings:
         exit_ll_min_adverse_z=_envf("EXIT_LL_MIN_ADVERSE_Z", 1.0),
         exit_ll_min_loss_pct=_envf("EXIT_LL_MIN_LOSS_PCT", -0.15),
         exit_hard_stop_loss_pct=_envf("EXIT_HARD_STOP_LOSS_PCT", -0.30),
+        exit_momentum_shield_z=_envf("EXIT_MOMENTUM_SHIELD_Z", 3.0),
 
         # Order Execution
         exec_order_fail_cooldown_sec=_envf("EXEC_ORDER_FAIL_COOLDOWN_SEC", 5.0),
