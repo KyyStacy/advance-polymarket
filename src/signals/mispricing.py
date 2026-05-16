@@ -94,6 +94,8 @@ class MispricingEvaluator:
         p_up = min(0.999, max(0.001, p_up))
         
         basis = {
+            "anchor_price": anchor_price,
+            "current_cex": current_cex,
             "log_now": log_now,
             "log_now_decayed": log_now_decayed,
             "mu_per_sec": mu,

@@ -358,7 +358,7 @@ class TradingBot:
             seconds_held = now - existing.opened_at
             ed = self.exit_engine.decide(
                 existing.side, sec_left, mom, ll, misp, unreal_pct,
-                sigma=self.misp_eval.sigma,
+                sigma=self.mispricing.sigma_per_sec,
                 seconds_held=seconds_held,
                 peak_unreal=self._peak_unreal,
             )

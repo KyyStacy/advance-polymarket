@@ -46,9 +46,11 @@ class ExitEngine:
         # 1. We are in the final stretch (last 120s).
         # 2. Mathematical safety is extreme (Z >= victory_lock_z).
         # 3. Momentum is NOT strongly against us (Adverse Z < 2.5).
-        if mispricing is not None and mispricing.anchor_price > 0 and seconds_left <= 120:
+        if mispricing is not None and mispricing.fair_basis.get('anchor_price', 0) > 0 and seconds_left <= 90:
             import math
-            log_dist = math.log(mispricing.current_cex / mispricing.anchor_price)
+            anchor = mispricing.fair_basis['anchor_price']
+            current = mispricing.fair_basis['current_cex']
+            log_dist = math.log(current / anchor)
             if side == "DOWN":
                 log_dist = -log_dist
             
