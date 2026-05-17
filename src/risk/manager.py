@@ -129,7 +129,7 @@ class RiskManager:
             f = 0.0
         else:
             f = max(0.0, edge / max(1e-6, 1.0 - implied_p))
-            f = min(f, 0.25)  # never bet more than 25% Kelly
+            f = min(f, s.risk_max_kelly_fraction)  # never bet more than maximum Kelly fraction
 
         # Probability-scaled ceiling: win_prob [0.5, 1.0] → ceiling [min_bet, base].
         # At 50% (coin flip) ceiling = min_bet; at 100% (certain) ceiling = base.
@@ -138,7 +138,7 @@ class RiskManager:
         ceil_usd = max(s.min_bet_usd, min(ceil_usd, base))
 
         # Kelly fraction scales within the probability-determined ceiling
-        size = ceil_usd * (f / 0.25) if f > 0 else 0.0
+        size = ceil_usd * (f / s.risk_max_kelly_fraction) if f > 0 else 0.0
         size = max(0.0, min(size, ceil_usd))
 
         if 0 < size < s.min_bet_usd:

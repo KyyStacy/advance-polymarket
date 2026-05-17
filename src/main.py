@@ -39,7 +39,7 @@ class TradingBot:
         setup_logger(self.s.log_level, self.s.log_file, console=False)
         self.log = get_logger()
 
-        self._dry_run_initial_bankroll = 100.0  # initial capital for dry run simulation
+        self._dry_run_initial_bankroll = self.s.dry_run_initial_bankroll  # initial capital for dry run simulation
 
         self.agg = PriceAggregator()
 
@@ -73,7 +73,7 @@ class TradingBot:
         self.momentum = MomentumAnalyzer(self.agg)
         self.leadlag = LeadLagDetector(self.agg)
         self.mispricing = MispricingEvaluator(
-            sigma_per_sec=0.00010,
+            sigma_per_sec=self.s.steady_sigma,
             momentum_drift_weight=self.s.sig_momentum_drift_weight,
             leadlag_drift_weight_per_bp=self.s.sig_leadlag_drift_weight_per_bp,
             log_now_decay=self.s.sig_log_now_decay,
@@ -95,8 +95,8 @@ class TradingBot:
         self._anchor_price: float | None = None
         self._anchor_bucket_ms: int = -1  # bucket_start_ms when anchor was locked
         self._tick_count: int = 0
-        # Polymarket taker fee — fixed at 2% (matches their published rate for prediction markets)
-        self._taker_fee_rate: float = 0.02
+        # Polymarket taker fee — matches their published rate for prediction markets
+        self._taker_fee_rate = self.s.polymarket_taker_fee_pct / 100.0
 
         # Dedup key for signal logging — only log when signal state changes
         self._last_signal_key: str = ""
@@ -924,6 +924,11 @@ class TradingBot:
             await self._strategy_loop()
         finally:
             self._stop.set()
+            display_task.cancel()
+            try:
+                await display_task
+            except asyncio.CancelledError:
+                pass
             self.vol_monitor.stop()
             await asyncio.gather(
                 self.binance.stop(),

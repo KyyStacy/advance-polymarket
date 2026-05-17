@@ -27,8 +27,8 @@ class VolatilityMonitor:
         self.s = settings
         
         # Parameters matching volatile-meter.txt
-        self.stdev_length = 20
-        self.hist_length = 252
+        self.stdev_length = settings.vol_stdev_length
+        self.hist_length = settings.vol_hist_length
         
         # Internal state
         self.price_history: List[float] = [] 

@@ -43,10 +43,10 @@ class ExitEngine:
     ) -> ExitDecision:
         # ---- VICTORY LOCK (Fix 6 - Paranoid Edition) ----
         # We only lock if:
-        # 1. We are in the final stretch (last 120s).
+        # 1. We are in the final stretch (last exit_victory_lock_sec).
         # 2. Mathematical safety is extreme (Z >= victory_lock_z).
-        # 3. Momentum is NOT strongly against us (Adverse Z < 2.5).
-        if mispricing is not None and mispricing.fair_basis.get('anchor_price', 0) > 0 and seconds_left <= 90:
+        # 3. Momentum is NOT strongly against us (Adverse Z < exit_victory_lock_max_adverse_z).
+        if mispricing is not None and mispricing.fair_basis.get('anchor_price', 0) > 0 and seconds_left <= self.s.exit_victory_lock_sec:
             import math
             anchor = mispricing.fair_basis['anchor_price']
             current = mispricing.fair_basis['current_cex']
@@ -60,7 +60,7 @@ class ExitEngine:
             if safety_z >= self.s.exit_victory_lock_z:
                 # Check for "Black Swan" momentum reversal
                 is_adverse_mom = (side == "UP" and momentum.direction == -1) or (side == "DOWN" and momentum.direction == 1)
-                if not (is_adverse_mom and momentum.z_score > 2.5):
+                if not (is_adverse_mom and momentum.z_score > self.s.exit_victory_lock_max_adverse_z):
                     return ExitDecision(False, f"victory-lock[protected] z={safety_z:.1f} mom-z={momentum.z_score:.1f}")
                 # If adverse momentum is too strong, fall through to normal exit logic!
 

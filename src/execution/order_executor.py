@@ -352,23 +352,7 @@ class OrderExecutor:
         except Exception as e:
             log.error(f"[exec] _bg_reconcile_buy error for {token_id[:8]}: {e}")
 
-    async def _wait_for_token_balance(
-        self,
-        token_id: str,
-        timeout_sec: float,
-        min_expected: float = 0.0,
-    ) -> float:
-        """Poll for token balance to arrive (settlement wait)."""
-        deadline = time.monotonic() + timeout_sec
-        last_bal = 0.0
-        while time.monotonic() < deadline:
-            bal = await self._get_token_balance_with_retry(token_id)
-            if bal is not None:
-                last_bal = bal
-                if bal >= min_expected - _BALANCE_DELTA_EPSILON:
-                    return bal
-            await asyncio.sleep(0.5)
-        return last_bal
+
 
     async def _bg_reconcile_sell(
         self,
@@ -397,10 +381,10 @@ class OrderExecutor:
                 # relay may have dropped the transaction. If tokens are still present,
                 # re-open the position so the strategy can retry the sell.
                 cur_token = await self._get_token_balance_with_retry(token_id)
-                if cur_token is not None and cur_token > _BALANCE_DELTA_EPSILON:
+                if cur_token is not None and cur_token > self.s.exec_balance_delta_epsilon:
                     log.error(
                         f"[exec] CRITICAL — SELL NOT CONFIRMED: {cur_token:.4f}sh still on-chain "
-                        f"after {_SELL_FILL_POLL_DEADLINE_SEC}s (Gnosis Safe relay may have dropped tx). "
+                        f"after {self.s.exec_sell_fill_poll_deadline_sec}s (Gnosis Safe relay may have dropped tx). "
                         "Re-opening position for retry."
                     )
                     if pos_side and pos_window_ts:
@@ -416,7 +400,7 @@ class OrderExecutor:
                         ))
                 else:
                     log.warning(
-                        f"[exec] SELL NOT RECONCILED within {_SELL_FILL_POLL_DEADLINE_SEC}s — "
+                        f"[exec] SELL NOT RECONCILED within {self.s.exec_sell_fill_poll_deadline_sec}s — "
                         f"estimate avg={response_avg:.4f} (balance shows 0 — assume filled)"
                     )
                 return
@@ -456,7 +440,7 @@ class OrderExecutor:
         batch (e.g. 1.4286sh) is still in transit through Gnosis Safe.
         """
         deadline = time.monotonic() + timeout_sec
-        threshold = max(_BALANCE_DELTA_EPSILON, min_expected * 0.50)
+        threshold = max(self.s.exec_balance_delta_epsilon, min_expected * 0.50)
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
             cur = await self._get_token_balance_with_retry(token_id)
@@ -495,7 +479,7 @@ class OrderExecutor:
         already blown past worst_price, saving the 1.7s timeout budget.
         """
         if self.in_cooldown():
-            log.info(f"[exec] buy skipped — executor in cooldown ({_ORDER_FAIL_COOLDOWN_SEC:.0f}s)")
+            log.info(f"[exec] buy skipped — executor in cooldown ({self.s.exec_order_fail_cooldown_sec:.0f}s)")
             return FillReport(False, 0.0, 0.0, 0.0, {}, error="cooldown")
         
         if token_id in self._pending_buys:
@@ -932,8 +916,8 @@ class OrderExecutor:
                     # check if tokens are gone (= sell confirmed) or still there (= retry).
                     if "sum of matched orders" in last_err:
                         log.warning(
-                            f"[exec] sell: existing order consuming all tokens "
-                            f"— polling up to 1.5s for confirmation..."
+                            "[exec] sell: existing order consuming all tokens "
+                            "— polling up to 1.5s for confirmation..."
                         )
                         # Poll-don't-sleep: bail out as soon as balance clears so
                         # the main loop isn't frozen for the full 1.5s. The previous
@@ -993,7 +977,7 @@ class OrderExecutor:
                             )
                             resp = None
                             continue
-                        elif cur_bal > _BALANCE_DELTA_EPSILON:
+                        elif cur_bal > self.s.exec_balance_delta_epsilon:
                             # Dust only — main batch still in transit through Gnosis Safe
                             self._slow_settlement_tokens.add(token_id)
                             log.warning(
@@ -1010,15 +994,15 @@ class OrderExecutor:
                     while time.monotonic() < _phantom2_deadline:
                         await asyncio.sleep(0.1)
                         cur_bal = await self._get_token_balance_with_retry(token_id)
-                        if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
+                        if cur_bal is None or cur_bal < self.s.exec_balance_delta_epsilon:
                             break
-                    if cur_bal is None or cur_bal < _BALANCE_DELTA_EPSILON:
+                    if cur_bal is None or cur_bal < self.s.exec_balance_delta_epsilon:
                         # CRITICAL BUG FIX: If we have a position from a successful API buy,
                         # but balance is 0, do NOT delete the position. It's likely just
                         # a settlement delay. Fail the sell attempt so it retries later.
                         log.error(
-                            f"[exec] CRITICAL: balance=0 but position tracked! "
-                            f"Buy settlement lagging? Skipping sell and retrying next tick."
+                            "[exec] CRITICAL: balance=0 but position tracked! "
+                            "Buy settlement lagging? Skipping sell and retrying next tick."
                         )
                         return FillReport(False, 0.0, 0.0, 0.0, {}, error="settlement-lag")
                     # Tokens appeared — sell was just very slow; retry once more
@@ -1074,9 +1058,9 @@ class OrderExecutor:
             last_err = err_msg
             is_fak = self._is_fak_kill(err_msg)
             
-            if is_fak and attempt < _SELL_MAX_ATTEMPTS:
+            if is_fak and attempt < self.s.exec_sell_max_attempts:
                 log.info(
-                    f"[exec] sell attempt {attempt}/{_SELL_MAX_ATTEMPTS} "
+                    f"[exec] sell attempt {attempt}/{self.s.exec_sell_max_attempts} "
                     f"rejected (no match) — retrying"
                 )
                 resp = None
@@ -1133,7 +1117,7 @@ class OrderExecutor:
                 )
                 sold_shares = cur_bal
                 pos.size_shares = cur_bal
-                if sold_shares * mark_price < _MIN_SELL_USD:
+                if sold_shares * mark_price < self.s.exec_min_sell_usd:
                     log.info(f"[exec] synced position for {token_id[:8]} is dust — closing")
                     self.positions.close(token_id, mark_price)
                     return FillReport(True, mark_price, 0.0, 0.0, {}, error="dust-sync")
@@ -1142,7 +1126,7 @@ class OrderExecutor:
 
             # Handle "Duplicated" sell: means a prior attempt with same nonce was
             # accepted by the chain. Poll balance to verify if tokens cleared.
-            if "duplicated" in err_msg.lower() and attempt <= _SELL_MAX_ATTEMPTS:
+            if "duplicated" in err_msg.lower() and attempt <= self.s.exec_sell_max_attempts:
                 log.warning(
                     f"[exec] SELL Duplicated — prior attempt may have filled. "
                     f"Polling {1.5:.0f}s for balance confirmation..."
@@ -1175,9 +1159,9 @@ class OrderExecutor:
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         if resp is None:
-            self._counters["sell_fak_killed"] += 1
+            self._counters["sell_filled"] += 0 # Placeholder for stats
             log.warning(
-                f"[exec] SELL UNFILLED after {_SELL_MAX_ATTEMPTS} attempts "
+                f"[exec] SELL UNFILLED after {self.s.exec_sell_max_attempts} attempts "
                 f"in {elapsed_ms:.0f}ms — last={last_err[:120]}"
             )
             return FillReport(False, 0.0, 0.0, 0.0, {}, error=f"fak-killed:{last_err}")

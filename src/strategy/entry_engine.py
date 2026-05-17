@@ -149,8 +149,8 @@ class EntryEngine:
                                      f"below-min-odds edge={mispricing.edge:.3f}<{self.s.ev_override_min_edge:.2f}")
 
         # Stricter Edge logic: Edge must comfortably exceed the current spread.
-        # Quality Filter: Required Edge = max(active_min_edge, spread * 1.25)
-        required_edge = max(self.active_min_edge, spread * 1.25)
+        # Quality Filter: Required Edge = max(active_min_edge, spread * entry_spread_edge_mult)
+        required_edge = max(self.active_min_edge, spread * self.s.entry_spread_edge_mult)
         if mispricing.edge < required_edge:
             self._persistence_counts.pop(signal_id, None)
             return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
@@ -159,7 +159,7 @@ class EntryEngine:
         # Momentum Velocity Filter
         ret30 = momentum.return_30s if side == "UP" else -momentum.return_30s
         ret60 = momentum.return_60s if side == "UP" else -momentum.return_60s
-        if ret30 < ret60 * 0.40:
+        if ret30 < ret60 * self.s.entry_mom_velocity_thresh:
              self._persistence_counts.pop(signal_id, None)
              return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
                                   f"momentum-velocity-low 30s={ret30:.6f} vs 60s={ret60:.6f}")
@@ -172,9 +172,9 @@ class EntryEngine:
                                   f"turbo-low-ask-risk ({implied_ask:.3f})")
 
         # High-odds quality gate
-        if implied_ask > 0.70 and leadlag is not None:
+        if implied_ask > self.s.entry_high_odds_thresh and leadlag is not None:
              ll_strength = abs(leadlag.deviation_bps)
-             if ll_strength < self.active_min_leadlag_bps * 1.5:
+             if ll_strength < self.active_min_leadlag_bps * self.s.entry_high_odds_ll_mult:
                   self._persistence_counts.pop(signal_id, None)
                   return EntryDecision(False, side, token_id, implied_ask, mispricing.edge,
                                        f"high-odds-ll-weak ask={implied_ask:.2f} ll={ll_strength:.1f}bps")

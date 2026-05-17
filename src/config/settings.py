@@ -96,6 +96,7 @@ class Settings:
     # Risk Management
     risk_consecutive_loss_cooldown_sec: float
     entry_turbo_low_ask_limit: float
+    risk_max_kelly_fraction: float
 
     # Entry Engine
     entry_min_exit_bid: float
@@ -142,6 +143,24 @@ class Settings:
     exec_sell_fill_poll_deadline_sec: float
     exec_min_sell_usd: float
     exec_post_sell_guard_sec: float
+
+    # Volatility Monitor
+    vol_stdev_length: int
+    vol_hist_length: int
+
+    # Entry Strategy Tweaks
+    entry_spread_edge_mult: float
+    entry_mom_velocity_thresh: float
+    entry_high_odds_thresh: float
+    entry_high_odds_ll_mult: float
+
+    # Victory Lock Tweaks
+    exit_victory_lock_sec: int
+    exit_victory_lock_max_adverse_z: float
+
+    # System parameters
+    polymarket_taker_fee_pct: float
+    dry_run_initial_bankroll: float
 
     # Adaptive Config
     vol_choppy_threshold: float
@@ -226,6 +245,7 @@ def load_settings(env_path: str | None = None) -> Settings:
         # Risk Management
         risk_consecutive_loss_cooldown_sec=_envf("RISK_CONSECUTIVE_LOSS_COOLDOWN_SEC", 300.0),
         entry_turbo_low_ask_limit=_envf("ENTRY_TURBO_LOW_ASK_LIMIT", 0.20),
+        risk_max_kelly_fraction=_envf("RISK_MAX_KELLY_FRACTION", 0.25),
         
         # Entry Engine
         entry_min_exit_bid=_envf("ENTRY_MIN_EXIT_BID", 0.10),
@@ -272,6 +292,24 @@ def load_settings(env_path: str | None = None) -> Settings:
         exec_sell_fill_poll_deadline_sec=_envf("EXEC_SELL_FILL_POLL_DEADLINE_SEC", 20.0),
         exec_min_sell_usd=_envf("EXEC_MIN_SELL_USD", 0.05),
         exec_post_sell_guard_sec=_envf("EXEC_POST_SELL_GUARD_SEC", 10.0),
+
+        # Volatility Monitor
+        vol_stdev_length=_envi("VOL_STDEV_LENGTH", 20),
+        vol_hist_length=_envi("VOL_HIST_LENGTH", 252),
+
+        # Entry Strategy Tweaks
+        entry_spread_edge_mult=_envf("ENTRY_SPREAD_EDGE_MULT", 1.25),
+        entry_mom_velocity_thresh=_envf("ENTRY_MOM_VELOCITY_THRESH", 0.40),
+        entry_high_odds_thresh=_envf("ENTRY_HIGH_ODDS_THRESH", 0.70),
+        entry_high_odds_ll_mult=_envf("ENTRY_HIGH_ODDS_LL_MULT", 1.5),
+
+        # Victory Lock Tweaks
+        exit_victory_lock_sec=_envi("EXIT_VICTORY_LOCK_SEC", 120),
+        exit_victory_lock_max_adverse_z=_envf("EXIT_VICTORY_LOCK_MAX_ADVERSE_Z", 2.5),
+
+        # System parameters
+        polymarket_taker_fee_pct=_envf("POLYMARKET_TAKER_FEE_PCT", 2.0),
+        dry_run_initial_bankroll=_envf("DRY_RUN_INITIAL_BANKROLL", 100.0),
 
         # Adaptive Config
         vol_choppy_threshold=_envf("VOL_CHOPPY_THRESHOLD", 4.0),
