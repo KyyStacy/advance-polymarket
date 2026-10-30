@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-label="Polymarket BTC 5m Bot">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0b1220"/><stop offset="1" stop-color="#1e1b4b"/></linearGradient>
+    <radialGradient id="glow" cx=".78" cy=".35" r=".55"><stop offset="0" stop-color="#fff" stop-opacity=".22"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.6" fill="#fff" fill-opacity=".12"/></pattern>
+    <clipPath id="card"><rect width="1280" height="400" rx="28"/></clipPath>
+  </defs>
+  <g clip-path="url(#card)">
+    <rect width="1280" height="400" fill="url(#bg)"/>
+    <rect width="1280" height="400" fill="url(#dots)"/>
+    <rect width="1280" height="400" fill="url(#glow)"/>
+    <circle cx="-40" cy="430" r="220" fill="#fff" fill-opacity=".06"/>
+    
+      <g transform="translate(790,60)">
+        <rect width="420" height="280" rx="22" fill="#0b1220" opacity=".75" stroke="#334155"/>
+        <line x1="20" x2="400" y1="60" y2="60" stroke="#334155" stroke-dasharray="4 6"/><line x1="20" x2="400" y1="115" y2="115" stroke="#334155" stroke-dasharray="4 6"/><line x1="20" x2="400" y1="170" y2="170" stroke="#334155" stroke-dasharray="4 6"/><line x1="20" x2="400" y1="225" y2="225" stroke="#334155" stroke-dasharray="4 6"/>
+        <line x1="40" x2="40" y1="172" y2="248" stroke="#22c55e" stroke-width="2"/><rect x="30" y="190" width="20" height="40" rx="3" fill="#22c55e"/><line x1="74" x2="74" y1="152" y2="218" stroke="#22c55e" stroke-width="2"/><rect x="64" y="170" width="20" height="30" rx="3" fill="#22c55e"/><line x1="108" x2="108" y1="132" y2="204" stroke="#ef4444" stroke-width="2"/><rect x="98" y="150" width="20" height="36" rx="3" fill="#ef4444"/><line x1="142" x2="142" y1="142" y2="206" stroke="#22c55e" stroke-width="2"/><rect x="132" y="160" width="20" height="28" rx="3" fill="#22c55e"/><line x1="176" x2="176" y1="112" y2="188" stroke="#22c55e" stroke-width="2"/><rect x="166" y="130" width="20" height="40" rx="3" fill="#22c55e"/><line x1="210" x2="210" y1="102" y2="162" stroke="#ef4444" stroke-width="2"/><rect x="200" y="120" width="20" height="24" rx="3" fill="#ef4444"/><line x1="244" x2="244" y1="92" y2="162" stroke="#22c55e" stroke-width="2"/><rect x="234" y="110" width="20" height="34" rx="3" fill="#22c55e"/><line x1="278" x2="278" y1="72" y2="138" stroke="#22c55e" stroke-width="2"/><rect x="268" y="90" width="20" height="30" rx="3" fill="#22c55e"/><line x1="312" x2="312" y1="78" y2="136" stroke="#ef4444" stroke-width="2"/><rect x="302" y="96" width="20" height="22" rx="3" fill="#ef4444"/><line x1="346" x2="346" y1="52" y2="124" stroke="#22c55e" stroke-width="2"/><rect x="336" y="70" width="20" height="36" rx="3" fill="#22c55e"/><line x1="380" x2="380" y1="42" y2="104" stroke="#22c55e" stroke-width="2"/><rect x="370" y="60" width="20" height="26" rx="3" fill="#22c55e"/>
+        <polyline points="20,236 80,210 140,220 200,170 260,160 320,110 400,80" fill="none" stroke="#60a5fa" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="290" y="20" width="56" height="28" rx="14" fill="#22c55e"/><text x="318" y="40" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="700" fill="#fff">UP</text>
+        <rect x="350" y="20" width="56" height="28" rx="14" fill="#ef4444"/><text x="378" y="40" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="700" fill="#fff">DOWN</text>
+      </g>
+    <text x="72" y="96" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#fff" fill-opacity=".8" letter-spacing="4">REED CODE · PORTFOLIO</text>
+    <text x="72" y="172" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="52" font-weight="800" fill="#fff">Polymarket BTC 5m Bot</text>
+    <text x="72" y="222" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="24" fill="#fff" fill-opacity=".88">Lead-lag arbitrage: CEX vs oracle Chainlink.</text>
+    <rect x="72" y="292" width="80" height="38" rx="19" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-opacity=".35"/><text x="112" y="317" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="600" fill="#fff">Python</text><rect x="163.6" y="292" width="60" height="38" rx="19" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-opacity=".35"/><text x="194" y="317" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="600" fill="#fff">Rust</text><rect x="236.0" y="292" width="108" height="38" rx="19" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-opacity=".35"/><text x="290" y="317" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="600" fill="#fff">WebSocket</text><rect x="356.4" y="292" width="89" height="38" rx="19" fill="#fff" fill-opacity=".14" stroke="#fff" stroke-opacity=".35"/><text x="401" y="317" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="600" fill="#fff">Polygon</text>
+  </g>
+</svg>
